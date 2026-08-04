@@ -1333,6 +1333,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     if not feature:
         raise WorkflowError("Feature idea must not be empty")
 
+    worktree_mode = getattr(args, "worktree_mode", "isolated")
+    if getattr(args, "allow_main", False) and worktree_mode != "current":
+        raise WorkflowError(
+            "--allow-main is only valid with --worktree-mode current."
+        )
+
     label = ""
     if getattr(args, "label", None):
         raw_label = args.label.strip()
@@ -1389,9 +1395,15 @@ def cmd_init(args: argparse.Namespace) -> int:
                 )
             run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-            worktree_mode = getattr(args, "worktree_mode", "isolated")
-            dirty = git(repo.canonical_root, "status", "--short", check=False).splitlines()
+            dirty = git(
+                repo.canonical_root, "status", "--porcelain", check=False
+            ).splitlines()
             if worktree_mode == "current":
+                if not repo.branch:
+                    raise WorkflowError(
+                        "Current-checkout mode does not support detached HEAD. "
+                        "Check out a named branch before initializing."
+                    )
                 if repo.branch in {"main", "master"} and not getattr(args, "allow_main", False):
                     raise WorkflowError(
                         "Current-checkout mode refuses to initialize on "
@@ -1404,6 +1416,8 @@ def cmd_init(args: argparse.Namespace) -> int:
                     suffix = "" if len(dirty) <= 5 else f" (+{len(dirty) - 5} more)"
                     raise WorkflowError(
                         "Current-checkout mode requires a clean working tree. "
+                        "Modified, staged, deleted, and untracked files all make "
+                        "the working tree unclean. "
                         f"Dirty entries: {preview}{suffix}"
                     )
 

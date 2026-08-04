@@ -187,6 +187,45 @@ class ControllerTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_current_mode_refuses_detached_head_even_with_main_override(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        subprocess.run(["git", "-C", str(repo), "branch", "-m", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "--detach", "HEAD"], check=True
+        )
+
+        result = self.run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Feature",
+            "--worktree-mode",
+            "current",
+            "--allow-main",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("detached HEAD", result.stderr)
+        self.assertIn("Check out a named branch", result.stderr)
+
+    def test_allow_main_requires_current_worktree_mode(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+
+        result = self.run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Feature",
+            "--allow-main",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "--allow-main is only valid with --worktree-mode current", result.stderr
+        )
+
     def test_current_mode_refuses_dirty_tree(self) -> None:
         repo = self.make_repo()
         state_home = self.make_state_home()
@@ -204,6 +243,25 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("clean working tree", result.stderr)
+
+    def test_current_mode_refuses_untracked_file(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self._checkout_feature_branch(repo)
+        (repo / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+
+        result = self.run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Feature",
+            "--worktree-mode",
+            "current",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("untracked files", result.stderr)
+        self.assertIn("untracked.txt", result.stderr)
 
     def test_current_mode_does_not_create_claude_worktrees(self) -> None:
         repo = self.make_repo()
