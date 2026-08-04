@@ -29,7 +29,7 @@ The plugin deliberately keeps Claude as the implementation orchestrator and uses
 | `/autonomous-development:autonomous-current` | Current checkout | Your already-created non-`main`/`master` feature branch | You created and switched to a clean feature branch yourself and want changes to land there. |
 | `/autonomous-development:autonomous-main` | Current checkout | `main` / `master` (explicit opt-in via `--allow-main`) | You explicitly want direct edits on `main`/`master`. Still requires a clean tree. |
 
-Both current-checkout workflows are opt-in. They do not create `.claude/worktrees/*`, do not enter a worktree, and never commit — the user reviews with normal `git diff` and commits manually. They require a clean working tree (`git status --porcelain` must be empty). `autonomous-current` additionally refuses `main`/`master`; `autonomous-main` passes `--allow-main` to bypass that guard.
+Both current-checkout workflows are opt-in. They do not create `.claude/worktrees/*`, do not enter a worktree, and never commit — the user reviews with normal `git diff` and commits manually. They require a clean working tree (`git status --porcelain` must be empty): modified, staged, deleted, and untracked files all make it unclean. They also require an attached named branch; detached HEAD is unsupported. `--allow-main` is valid only with `--worktree-mode current`; `autonomous-current` refuses `main`/`master`, while `autonomous-main` passes `--allow-main` to bypass that guard.
 
 ## Upstream
 
@@ -344,7 +344,8 @@ their own feature branches first and want the agent's changes to land directly i
 In current mode the controller uses the current project root for both
 `repository.canonical_root` and `repository.worktree_path`, records the current branch in
 baseline metadata, does not create a `.claude/worktrees/*` worktree or `worktree-*` branch,
-refuses `main`/`master` unless you pass `--allow-main`, and refuses a dirty tree.
+refuses detached HEAD and `main`/`master` unless you pass `--allow-main`, and refuses a
+dirty tree containing modified, staged, deleted, or untracked files.
 
 ## Run states
 
