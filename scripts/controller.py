@@ -52,6 +52,8 @@ from state import (
     LEGACY_STATE_REL,
 )
 from schema_validation import SchemaValidationError, validate_payload
+import config as user_config
+from config import ConfigError
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PHASE_OUTPUTS = {
@@ -392,9 +394,18 @@ def resolve_phase_profile(phase: str) -> dict[str, str]:
     return profile
 
 
-def codex_profile_args(profile: dict[str, str]) -> list[str]:
-    """Render a phase profile as Codex CLI arguments (`-c key=value` and `--model`)."""
+def codex_profile_args(
+    profile: dict[str, str], profile_id: str | None = None
+) -> list[str]:
+    """Render a phase profile as Codex CLI arguments.
+
+    When ``profile_id`` is provided, prepends ``--profile <id>``. Selecting a
+    profile never rewrites ``~/.codex/config.toml`` or a profile file: the id
+    is passed to ``codex exec`` and Codex resolves it itself.
+    """
     args: list[str] = []
+    if profile_id:
+        args += ["--profile", str(profile_id)]
     mapping = (
         ("reasoning", "model_reasoning_effort"),
         ("reasoning_summary", "model_reasoning_summary"),
@@ -408,6 +419,204 @@ def codex_profile_args(profile: dict[str, str]) -> list[str]:
     if model:
         args += ["--model", model]
     return args
+
+
+# Storage-layer key names (config.py / snapshot) → legacy profile keys used
+# inside the controller for backward compatibility with PHASE_PROFILES.
+_CONFIG_TO_PROFILE_KEY = {
+    "reasoning_effort": "reasoning",
+    "reasoning_summary": "reasoning_summary",
+    "verbosity": "verbosity",
+    "model": "model",
+}
+
+
+def resolve_phase_execution(
+    phase: str,
+    snapshot: dict[str, Any] | None = None,
+    loaded_config: dict[str, Any] | None = None,
+    preset_name: str | None = None,
+) -> tuple[dict[str, str], str | None]:
+    """Return ``(profile_dict, profile_id)`` for a phase.
+
+    Snapshot semantics (authoritative for active runs):
+
+      When ``snapshot`` is provided (an init-time ``config_snapshot`` block),
+      it is the SOLE source of truth for this phase. Environment overrides
+      were captured into the snapshot at init and MUST NOT be reapplied on
+      subsequent phase invocations; changing an env var after init has no
+      effect on an active run. Missing keys fall through to
+      ``PHASE_PROFILES`` defaults, and a missing snapshot phase means "use
+      the built-in defaults", which is a valid configuration and means
+      normal Codex behavior.
+
+    Legacy / init-time semantics (when ``snapshot`` is None):
+
+      Precedence, highest to lowest — used for legacy runs without a
+      snapshot AND at init time when computing the snapshot itself:
+
+        1. ``CLAUDE_AUTONOMOUS_PHASE_PROFILES`` /
+           ``CLAUDE_AUTONOMOUS_CODEX_MODEL_<PHASE>``;
+        2. Fresh config lookup (when ``loaded_config`` is provided);
+        3. Built-in ``PHASE_PROFILES`` defaults.
+    """
+    profile = dict(PHASE_PROFILES.get(phase, _DEFAULT_PROFILE))
+    profile_id: str | None = None
+
+    if snapshot is not None:
+        codex = snapshot.get("codex", {}) if isinstance(snapshot, dict) else {}
+        phase_cfg = codex.get(phase) if isinstance(codex, dict) else None
+        if isinstance(phase_cfg, dict):
+            for src, dst in _CONFIG_TO_PROFILE_KEY.items():
+                if src in phase_cfg:
+                    profile[dst] = str(phase_cfg[src])
+            snap_id = phase_cfg.get("profile")
+            if isinstance(snap_id, str) and snap_id:
+                profile_id = snap_id
+        return profile, profile_id
+
+    if loaded_config is not None:
+        overlay = user_config.resolve_for_phase(
+            loaded_config, phase, preset_name=preset_name
+        )
+    else:
+        overlay = user_config.resolve_for_phase({}, phase)
+    for src, dst in _CONFIG_TO_PROFILE_KEY.items():
+        if src in overlay:
+            profile[dst] = str(overlay[src])
+    pid = overlay.get("profile")
+    if isinstance(pid, str) and pid:
+        profile_id = pid
+
+    return profile, profile_id
+
+
+# ---------------------------------------------------------------------------
+# User configuration helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_config_path(args: argparse.Namespace, state_home: Path) -> Path:
+    return user_config.resolve_config_path(
+        state_home, getattr(args, "config_path", None)
+    )
+
+
+def _load_effective_config(
+    args: argparse.Namespace, state_home: Path
+) -> tuple[dict[str, Any] | None, Path, bool]:
+    """Load the config file if present or an explicit path was supplied.
+
+    Returns ``(config_or_none, path, explicit)``. ``config_or_none`` is
+    ``None`` when the file is absent and no ``--config-path`` was supplied,
+    so legacy installations without a config keep their historical behavior.
+    """
+    explicit = bool(getattr(args, "config_path", None))
+    path = _resolve_config_path(args, state_home)
+    if not path.exists() and not explicit:
+        return None, path, False
+    return user_config.load_config(path), path, explicit
+
+
+def _load_and_snapshot_config(
+    args: argparse.Namespace, state_home: Path
+) -> tuple[dict[str, Any] | None, list[str], dict[str, Any] | None]:
+    """Load config, resolve effective values, and produce a run snapshot.
+
+    Returns ``(snapshot, warnings, config)``. ``snapshot`` and ``config`` are
+    both ``None`` when no config file is present and no explicit
+    ``--config-path`` was supplied. The snapshot bakes in every environment
+    variable that participates in per-phase Codex resolution at init time so
+    the run is pinned against later environment changes.
+
+    Fails closed on any referenced Codex profile that does not resolve to a
+    valid profile under the effective Codex home. Failing closed applies
+    equally whether the preset was selected explicitly via ``--preset`` or
+    from ``active_preset`` — a snapshot that would silently point at a
+    missing profile is refused. An omitted profile means "use normal Codex
+    defaults" and remains valid.
+    """
+    config, path, _explicit = _load_effective_config(args, state_home)
+    if config is None:
+        return None, [], None
+    warnings = user_config.validate_config(config)
+    preset_override = getattr(args, "preset", None) or None
+    snapshot = user_config.snapshot_for_run(config, preset_name=preset_override)
+
+    codex_home = user_config.resolve_codex_home()
+    profiles = user_config.list_codex_profiles(codex_home)
+    valid_ids = {p["id"] for p in profiles if p.get("valid")}
+    known_ids = {p["id"] for p in profiles}
+    for phase, phase_cfg in (snapshot.get("codex") or {}).items():
+        pid = phase_cfg.get("profile")
+        if not pid:
+            # No profile means "use normal Codex defaults", which is valid.
+            continue
+        if pid in valid_ids:
+            continue
+        if pid in known_ids:
+            raise WorkflowError(
+                f"phase {phase!r} references Codex profile {pid!r} which is "
+                f"present under {codex_home} but is malformed; fix or remove "
+                "the profile before starting a run."
+            )
+        raise WorkflowError(
+            f"phase {phase!r} references Codex profile {pid!r} which was "
+            f"not found under {codex_home}. Add the profile "
+            f"{codex_home / (pid + '.config.toml')} or update the "
+            "autonomous configuration."
+        )
+
+    runtime = snapshot.get("claude_runtime")
+    if runtime:
+        runtimes = (config.get("claude_runtimes") or {})
+        if runtime not in runtimes:
+            raise WorkflowError(
+                f"Preset references claude_runtime {runtime!r} which is not "
+                "defined in the configuration."
+            )
+    return snapshot, warnings, config
+
+
+def _resolve_workflow_mode(
+    cli_mode: str | None,
+    snapshot: dict[str, Any] | None,
+    loaded_config: dict[str, Any] | None,
+) -> tuple[str, str]:
+    """Return ``(requested_mode, origin)``.
+
+    Precedence, highest to lowest:
+
+    1. explicit ``--mode`` on the CLI (``origin='cli'``);
+    2. the selected preset's ``workflow_mode`` from the snapshot
+       (``origin='preset'``);
+    3. the config-file top-level ``[workflow].workflow_mode``
+       (``origin='config'``);
+    4. the built-in default (``origin='default'``), ``auto``, which
+       preserves the existing risk-escalation semantics.
+    """
+    if cli_mode is not None:
+        return cli_mode, "cli"
+
+    # Consult the preset table directly (not the merged effective workflow
+    # block) so preset-supplied and config-level workflow modes are
+    # distinguishable in the recorded origin.
+    if loaded_config is not None and snapshot is not None:
+        preset_name = snapshot.get("preset")
+        if isinstance(preset_name, str) and preset_name:
+            presets = loaded_config.get("presets", {}) or {}
+            preset = presets.get(preset_name)
+            if isinstance(preset, dict):
+                preset_mode = preset.get("workflow_mode")
+                if isinstance(preset_mode, str) and preset_mode in WORKFLOW_MODES:
+                    return preset_mode, "preset"
+
+    if loaded_config is not None:
+        config_default = user_config.workflow_mode_default(loaded_config)
+        if config_default is not None:
+            return config_default, "config"
+
+    return "auto", "default"
 
 
 # ---------------------------------------------------------------------------
@@ -1413,8 +1622,20 @@ def cmd_init(args: argparse.Namespace) -> int:
             (run_dir / "feature-request.md").write_text(feature + "\n", encoding="utf-8")
             (run_dir / "repository-context.txt").write_text(ctx_text, encoding="utf-8")
 
-            requested_mode = getattr(args, "mode", "auto")
+            # Snapshot the effective user configuration so subsequent phases
+            # cannot silently drift when the global preset changes mid-run.
+            # Env-based overrides participating in per-phase Codex resolution
+            # are baked into the snapshot at this point too.
+            config_snapshot, config_warnings, loaded_config = _load_and_snapshot_config(
+                args, state_home
+            )
+            requested_mode, mode_origin = _resolve_workflow_mode(
+                cli_mode=getattr(args, "mode", None),
+                snapshot=config_snapshot,
+                loaded_config=loaded_config,
+            )
             effective_mode, mode_reasons = select_mode(requested_mode, feature)
+            mode_reasons = [f"origin={mode_origin}: {reason}" for reason in mode_reasons]
             # `auto`/explicit rigorous runs are safety-sensitive: require adversarial.
             risk_reasons: list[str] = []
             requires_adversarial = effective_mode == "rigorous"
@@ -1440,6 +1661,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 },
                 "requested_mode": requested_mode,
                 "effective_mode": effective_mode,
+                "mode_origin": mode_origin,
                 "mode_reasons": mode_reasons,
                 "max_review_rounds": args.max_review_rounds,
                 "review_round": 0,
@@ -1461,6 +1683,14 @@ def cmd_init(args: argparse.Namespace) -> int:
                 },
                 "notes": [],
             }
+            if config_snapshot is not None:
+                state["config_snapshot"] = config_snapshot
+                if config_snapshot.get("preset"):
+                    state["preset"] = config_snapshot["preset"]
+            if config_warnings:
+                state.setdefault("notes", []).extend(
+                    f"config: {w}" for w in config_warnings
+                )
             save_run_state(run_dir, state)
 
         # Save repo metadata while still holding RepoInitLock. Two concurrent
@@ -1599,7 +1829,10 @@ def cmd_codex(args: argparse.Namespace) -> int:
     stage_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     output_path = run_dir / f".staging-{stage_id}.codex.json"
 
-    profile = resolve_phase_profile(phase)
+    snapshot = state.get("config_snapshot") if isinstance(state, dict) else None
+    profile, profile_id = resolve_phase_execution(
+        phase, snapshot=snapshot if isinstance(snapshot, dict) else None
+    )
     command = [
         "codex",
         "exec",
@@ -1610,7 +1843,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
         str(PLUGIN_ROOT / schema_rel),
         "--output-last-message",
         str(output_path),
-        *codex_profile_args(profile),
+        *codex_profile_args(profile, profile_id=profile_id),
         "-",
     ]
     started_at = utc_now()
@@ -1845,6 +2078,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 "prompt_characters": len(prompt),
                 "output_characters": len(output_text),
                 "duration_seconds": duration_seconds,
+                "profile": profile_id,
                 "model": recorded_model,
                 "reasoning_effort": profile.get("reasoning"),
                 "verbosity": profile.get("verbosity"),
@@ -3245,6 +3479,197 @@ def cmd_next_action(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# User-configuration subcommands
+# ---------------------------------------------------------------------------
+
+
+def _print_json(payload: Any) -> None:
+    sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+
+
+def _load_config_for_cmd(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], Path]:
+    _, state_home, _ = get_context(args)
+    path = _resolve_config_path(args, state_home)
+    try:
+        return user_config.load_config(path), path
+    except ConfigError as exc:
+        raise WorkflowError(str(exc)) from exc
+
+
+def _persist_config(path: Path, config: dict[str, Any]) -> None:
+    try:
+        user_config.save_config(path, config)
+    except ConfigError as exc:
+        raise WorkflowError(str(exc)) from exc
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    config, path = _load_config_for_cmd(args)
+    try:
+        effective = user_config.effective_with_origin(config, path)
+    except ConfigError as exc:
+        raise WorkflowError(str(exc)) from exc
+    warnings = user_config.validate_config(config)
+    payload = {
+        **effective,
+        "warnings": warnings,
+        "presets": sorted((config.get("presets") or {}).keys()),
+        "claude_runtimes": sorted((config.get("claude_runtimes") or {}).keys()),
+    }
+    if getattr(args, "json", True):
+        _print_json(payload)
+    else:
+        _print_json(payload)  # single canonical format
+    return 0
+
+
+def cmd_config_validate(args: argparse.Namespace) -> int:
+    _, state_home, _ = get_context(args)
+    path = _resolve_config_path(args, state_home)
+    try:
+        config = user_config.load_config(path)
+        warnings = user_config.validate_config(config)
+        payload: dict[str, Any] = {
+            "config_path": str(path),
+            "config_exists": path.exists(),
+            "valid": True,
+            "warnings": warnings,
+        }
+        _print_json(payload)
+        return 0
+    except ConfigError as exc:
+        payload = {
+            "config_path": str(path),
+            "config_exists": path.exists(),
+            "valid": False,
+            "error": str(exc),
+            "warnings": [],
+        }
+        _print_json(payload)
+        return 1
+
+
+def cmd_config_list_profiles(args: argparse.Namespace) -> int:
+    codex_home = user_config.resolve_codex_home()
+    profiles = user_config.list_codex_profiles(codex_home)
+    _print_json({"codex_home": str(codex_home), "profiles": profiles})
+    return 0
+
+
+def cmd_config_list_presets(args: argparse.Namespace) -> int:
+    config, path = _load_config_for_cmd(args)
+    presets = config.get("presets") or {}
+    result = []
+    for name in sorted(presets.keys()):
+        preset = presets[name] or {}
+        result.append(
+            {
+                "name": name,
+                "workflow_mode": preset.get("workflow_mode"),
+                "claude_runtime": preset.get("claude_runtime"),
+                "phases": sorted((preset.get("codex") or {}).keys()),
+            }
+        )
+    _print_json(
+        {
+            "config_path": str(path),
+            "active_preset": config.get("active_preset"),
+            "presets": result,
+        }
+    )
+    return 0
+
+
+def cmd_config_set_active_preset(args: argparse.Namespace) -> int:
+    config, path = _load_config_for_cmd(args)
+    try:
+        updated = user_config.set_active_preset(config, args.name)
+    except ConfigError as exc:
+        raise WorkflowError(str(exc)) from exc
+    _persist_config(path, updated)
+    _print_json(
+        {
+            "config_path": str(path),
+            "active_preset": updated["active_preset"],
+        }
+    )
+    return 0
+
+
+def cmd_config_set_phase(args: argparse.Namespace) -> int:
+    config, path = _load_config_for_cmd(args)
+    try:
+        updated = user_config.set_phase(
+            config,
+            args.preset,
+            args.phase,
+            profile=getattr(args, "profile", None),
+            model=getattr(args, "model", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
+            reasoning_summary=getattr(args, "reasoning_summary", None),
+            verbosity=getattr(args, "verbosity", None),
+        )
+    except ConfigError as exc:
+        raise WorkflowError(str(exc)) from exc
+    _persist_config(path, updated)
+    _print_json(
+        {
+            "config_path": str(path),
+            "preset": args.preset,
+            "phase": args.phase,
+            "effective": (
+                (updated.get("presets") or {}).get(args.preset, {}).get("codex", {}).get(args.phase, {})
+            ),
+        }
+    )
+    return 0
+
+
+def cmd_config_list_claude_runtimes(args: argparse.Namespace) -> int:
+    config, path = _load_config_for_cmd(args)
+    runtimes = config.get("claude_runtimes") or {}
+    result = []
+    for name in sorted(runtimes.keys()):
+        rt = runtimes[name] or {}
+        launcher = rt.get("launcher") or ""
+        launcher_path = Path(launcher).expanduser() if launcher else None
+        exists = bool(launcher_path and launcher_path.exists())
+        executable = bool(exists and os.access(launcher_path, os.X_OK))
+        result.append(
+            {
+                "name": name,
+                "display_name": rt.get("display_name"),
+                "launcher": launcher,
+                "args": list(rt.get("args") or []),
+                "launcher_exists": exists,
+                "launcher_executable": executable,
+            }
+        )
+    _print_json({"config_path": str(path), "claude_runtimes": result})
+    return 0
+
+
+def cmd_config_set_claude_runtime(args: argparse.Namespace) -> int:
+    config, path = _load_config_for_cmd(args)
+    try:
+        updated = user_config.set_claude_runtime(config, args.name)
+    except ConfigError as exc:
+        raise WorkflowError(str(exc)) from exc
+    _persist_config(path, updated)
+    _print_json(
+        {
+            "config_path": str(path),
+            "active_preset": updated.get("active_preset"),
+            "claude_runtime": args.name,
+        }
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -3256,6 +3681,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--state-dir", help="Override state home directory")
     parser.add_argument("--run-id", help="Specify run ID for run-scoped commands")
+    parser.add_argument(
+        "--config-path",
+        help="Override the autonomous-development config file path "
+        "(defaults to <state-home>/config.toml)",
+    )
     sub = parser.add_subparsers(dest="command_name", required=True)
 
     doctor = sub.add_parser(
@@ -3269,8 +3699,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--mode",
         choices=WORKFLOW_MODES,
-        default="auto",
-        help="Workflow rigor mode; auto escalates conservatively by risk",
+        default=None,
+        help="Workflow rigor mode; overrides any preset/config default. "
+        "When omitted, the mode is resolved from the selected preset, then "
+        "the config-file workflow default, then 'auto' (which escalates "
+        "conservatively by risk).",
     )
     init.add_argument(
         "--worktree-mode",
@@ -3284,6 +3717,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow current-checkout mode on main/master (still requires a clean tree)",
     )
     init.add_argument("--max-review-rounds", type=int, default=3, choices=range(1, 6))
+    init.add_argument(
+        "--preset",
+        help="Override the configuration's active preset for this run only",
+    )
     init.add_argument("--reuse", action="store_true")
     init.add_argument("--force", action="store_true")
     init.set_defaults(func=cmd_init)
@@ -3434,6 +3871,82 @@ def build_parser() -> argparse.ArgumentParser:
     )
     accept_drift.set_defaults(func=cmd_accept_drift)
 
+    # ---- config-* subcommands ---------------------------------------------
+    cfg_show = sub.add_parser(
+        "config-show",
+        help="Print the effective autonomous-development configuration as JSON",
+    )
+    cfg_show.add_argument(
+        "--json", action="store_true", default=True, help=argparse.SUPPRESS
+    )
+    cfg_show.set_defaults(func=cmd_config_show)
+
+    cfg_validate = sub.add_parser(
+        "config-validate", help="Validate the config file and report warnings"
+    )
+    cfg_validate.add_argument(
+        "--json", action="store_true", default=True, help=argparse.SUPPRESS
+    )
+    cfg_validate.set_defaults(func=cmd_config_validate)
+
+    cfg_profiles = sub.add_parser(
+        "config-list-profiles",
+        help="Discover Codex profiles under $CODEX_HOME (or ~/.codex)",
+    )
+    cfg_profiles.add_argument(
+        "--json", action="store_true", default=True, help=argparse.SUPPRESS
+    )
+    cfg_profiles.set_defaults(func=cmd_config_list_profiles)
+
+    cfg_presets = sub.add_parser(
+        "config-list-presets", help="List presets defined in the config file"
+    )
+    cfg_presets.add_argument(
+        "--json", action="store_true", default=True, help=argparse.SUPPRESS
+    )
+    cfg_presets.set_defaults(func=cmd_config_list_presets)
+
+    cfg_active = sub.add_parser(
+        "config-set-active-preset", help="Set the active preset in the config file"
+    )
+    cfg_active.add_argument("name", help="Preset name to activate")
+    cfg_active.set_defaults(func=cmd_config_set_active_preset)
+
+    cfg_phase = sub.add_parser(
+        "config-set-phase",
+        help="Update a preset's per-phase Codex profile / reasoning settings",
+    )
+    cfg_phase.add_argument("--preset", required=True)
+    cfg_phase.add_argument(
+        "--phase", required=True, choices=list(user_config.VALID_PHASES)
+    )
+    cfg_phase.add_argument("--profile", help="Codex profile id (e.g. azure-gpt5p6-sol)")
+    cfg_phase.add_argument("--model", help="Explicit Codex model override")
+    cfg_phase.add_argument(
+        "--reasoning-effort",
+        dest="reasoning_effort",
+        choices=list(user_config.VALID_REASONING),
+    )
+    cfg_phase.add_argument("--reasoning-summary")
+    cfg_phase.add_argument("--verbosity")
+    cfg_phase.set_defaults(func=cmd_config_set_phase)
+
+    cfg_runtimes = sub.add_parser(
+        "config-list-claude-runtimes",
+        help="List Claude runtime definitions from the config file",
+    )
+    cfg_runtimes.add_argument(
+        "--json", action="store_true", default=True, help=argparse.SUPPRESS
+    )
+    cfg_runtimes.set_defaults(func=cmd_config_list_claude_runtimes)
+
+    cfg_set_runtime = sub.add_parser(
+        "config-set-claude-runtime",
+        help="Set the active preset's Claude runtime by name",
+    )
+    cfg_set_runtime.add_argument("name", help="Claude runtime name")
+    cfg_set_runtime.set_defaults(func=cmd_config_set_claude_runtime)
+
     return parser
 
 
@@ -3442,7 +3955,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         return int(args.func(args))
-    except (WorkflowError, StateError) as exc:
+    except (WorkflowError, StateError, ConfigError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
