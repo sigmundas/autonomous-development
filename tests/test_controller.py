@@ -2581,7 +2581,10 @@ class LegacyMigrationIntegrityTests(unittest.TestCase):
         s = json.loads(published.read_text(encoding="utf-8"))
         self.assertEqual(s["run_id"], "legacy-run-aaa")
         self.assertEqual(s["schema_version"], 2)
-        self.assertEqual(s["migrated_from"], str(legacy_dir))
+        self.assertEqual(
+            Path(s["migrated_from"]).resolve(),
+            legacy_dir.resolve(),
+        )
         # Original legacy state is untouched.
         self.assertEqual((legacy_dir / "run-state.json").read_bytes(), legacy_before)
         # No staging temp dir survives.
