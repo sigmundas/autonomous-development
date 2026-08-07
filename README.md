@@ -110,6 +110,12 @@ make check
 claude plugin validate . --strict
 ```
 
+### Human decision pauses
+
+A run may pause when it genuinely requires a human decision it cannot safely
+infer on its own. After you supply the decision, the run can continue from
+where it paused.
+
 ## Adaptive workflow modes
 
 `init` accepts `--mode` to scale workflow depth to the change:

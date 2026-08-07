@@ -48,6 +48,14 @@ directly in that branch — no disposable worktree, no `.claude/worktrees/*` clo
   workflow mode — the configured/snapshotted mode does. A lean preset (or `--mode lean`) is the
   way to request lighter phases; there is no "skip controller" affordance. If a lightweight
   direct-edit is what the user wants, they will invoke a different command, not this one.
+- **Invoke the controller directly and inspect its original Bash result.** One `controller.py`
+  invocation must be one Bash tool call containing one command. Never append `echo $?`,
+  `echo "EXIT=$?"`, or another exit-code probe; redirect controller output to `/tmp` merely to
+  inspect it; wrap it in `tail`, `cat`, `tee`, `grep`, a pipe, shell chaining, or command
+  substitution merely to inspect output; or retry it solely to determine its exit status. Rely
+  on the Bash tool result from the original controller invocation. For example, run
+  `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" codex --phase plan` directly, not a
+  redirected or chained wrapper.
 - **Terminate only on a controller-authorized state.** Stop when the controller reports the run
   as `complete`, `blocked`, `cancelled`, or when you have explicitly marked it awaiting a genuine
   human decision (see below). Do not otherwise decide the workflow is finished.

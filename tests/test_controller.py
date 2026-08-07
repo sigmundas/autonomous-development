@@ -3686,6 +3686,35 @@ class SkillContractTests(unittest.TestCase):
         # words is fine).
         self.assertIn("only the whole reason is compared", normalized)
 
+    def _assert_direct_controller_invocation_contract(self, name: str) -> None:
+        """Controller commands must remain simple bounded Bash calls whose
+        original tool result supplies status and output."""
+        normalized = self._normalized(self._skill_text(name))
+        self.assertIn(
+            "One `controller.py` invocation must be one Bash tool call "
+            "containing one command",
+            normalized,
+        )
+        self.assertIn("Never append `echo $?`", normalized)
+        self.assertIn("`echo \"EXIT=$?\"`", normalized)
+        self.assertIn("redirect controller output to `/tmp`", normalized)
+        for wrapper in ("`tail`", "`cat`", "`tee`", "`grep`"):
+            self.assertIn(wrapper, normalized)
+        self.assertIn("a pipe", normalized)
+        self.assertIn("shell chaining", normalized)
+        self.assertIn("command substitution", normalized)
+        self.assertIn("retry it solely to determine its exit status", normalized)
+        self.assertIn(
+            "Rely on the Bash tool result from the original controller "
+            "invocation",
+            normalized,
+        )
+        self.assertIn(
+            '`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" codex '
+            "--phase plan` directly",
+            normalized,
+        )
+
     def test_autonomous_current_forbids_bypass_by_task_size(self) -> None:
         self._assert_controller_first_contract("autonomous-current")
 
@@ -3703,6 +3732,15 @@ class SkillContractTests(unittest.TestCase):
 
     def test_autonomous_feature_documents_await_decision_contract(self) -> None:
         self._assert_await_decision_contract("autonomous-feature")
+
+    def test_autonomous_current_requires_direct_controller_invocations(self) -> None:
+        self._assert_direct_controller_invocation_contract("autonomous-current")
+
+    def test_autonomous_main_requires_direct_controller_invocations(self) -> None:
+        self._assert_direct_controller_invocation_contract("autonomous-main")
+
+    def test_autonomous_feature_requires_direct_controller_invocations(self) -> None:
+        self._assert_direct_controller_invocation_contract("autonomous-feature")
 
 
 if __name__ == "__main__":
