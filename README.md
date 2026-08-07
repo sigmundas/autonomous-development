@@ -33,7 +33,7 @@ Both current-checkout workflows are opt-in. They do not create `.claude/worktree
 
 ## Upstream
 
-This plugin is based on [quaat/autonomous-development](https://github.com/quaat/autonomous-development). This fork keeps the original workflow and adds the current-checkout mode and related documentation updates.
+This plugin is based on [quaat/autonomous-development](https://github.com/quaat/autonomous-development). This fork keeps the original workflow and adds current-checkout entry points plus configuration, safety, and integration updates documented below.
 
 ## Included skills
 
@@ -79,6 +79,66 @@ Install Codex CLI when needed:
 npm install -g @openai/codex
 codex login
 ```
+
+### Azure OpenAI / Codex CLI compatibility
+
+The Azure-backed autonomous profile `azure-gpt5p6-sol` (model
+`gpt-5.6-sol`, `wire_api = "responses"`) is validated with **codex-cli
+0.146.1**. The controller and VS Code extension profile wiring are correct;
+the compatibility constraint is in the upstream Codex CLI/provider request.
+
+Do not use codex-cli 0.147.0 with this Azure setup. The incompatibility was
+reproduced with the Homebrew 0.147.0 build: that release sends an empty
+description for the Responses Lite `functions` tool namespace, which Azure
+rejects with:
+
+```text
+Invalid 'input[0].tools[0].description': empty string.
+```
+
+The visible model-catalog warning is a separate, non-fatal condition. Azure's
+`/openai/v1/models` endpoint returns an OpenAI-style `{ "object": "list",
+"data": [...] }` response, while the Codex model manager also attempts to
+decode another catalog schema. In 0.146.1 the refresh warning may be large, but
+Codex falls back to its bundled catalog and continues successfully. Do not
+treat that warning alone as a failed invocation. A bundled
+`0.147.0-alpha.6.5` pre-release was also observed to work, but extension-bundled
+or pre-release binaries are not a supported workaround.
+
+Until a later upstream Codex release fixes the Azure empty-description
+incompatibility, pin or downgrade Codex using the installation method you
+manage locally. For example, npm users can select the validated version with:
+
+```bash
+npm install -g @openai/codex@0.146.1
+codex --version
+# codex-cli 0.146.1
+```
+
+Verify the configured profile independently of the controller:
+
+```bash
+codex exec --ephemeral --json --sandbox read-only \
+  --profile azure-gpt5p6-sol \
+  -c model_reasoning_effort=high \
+  -c model_reasoning_summary=none \
+  -c model_verbosity=low \
+  'Return exactly OK.'
+```
+
+Success means an `item.completed` event with text `OK`, followed by
+`turn.completed` and exit code 0. The model-catalog warning may still appear.
+The regression was narrowed to upstream Codex Responses Lite tool
+canonicalization introduced between 0.146.1 and 0.147.0 (see upstream commit
+[`f21dc463`](https://github.com/openai/codex/commit/f21dc4638803f40046c9e294b0349782928f6b36)).
+
+`controller.py doctor` currently checks that Codex is installed and reports
+its version; it does not execute a live request against the selected provider.
+It can therefore report Codex as ready even when the first real invocation is
+provider-incompatible. Also note that controller failure diagnostics emphasize
+stderr: in this incident the non-fatal catalog warning was on stderr, while the
+fatal Azure API response was in Codex's stdout NDJSON. Use the direct minimal
+test above when diagnosing this distinction.
 
 The official OpenAI Codex plugin for Claude Code is optional for this project because the workflow invokes `codex exec` directly to obtain schema-validated output. It remains useful for manual `/codex:*` commands:
 
