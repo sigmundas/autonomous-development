@@ -17,6 +17,7 @@ class ProjectLayoutTests(unittest.TestCase):
             "autonomous-feature",
             "autonomous-current",
             "autonomous-main",
+            "autonomous-resume",
             "enhance-idea",
             "implementation-plan",
             "implement-plan",
@@ -146,6 +147,49 @@ class ProjectLayoutTests(unittest.TestCase):
         head = text.split("---", 2)[1]
         self.assertIn("EnterWorktree", head)
         self.assertIn("ExitWorktree", head)
+
+    def test_autonomous_resume_requires_explicit_run_and_never_initializes(self) -> None:
+        text = (ROOT / "skills" / "autonomous-resume" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        head = text.split("---", 2)[1]
+        self.assertIn('argument-hint: "<run-id>"', head)
+        self.assertIn("disable-model-invocation: true", head)
+        self.assertIn("exactly one non-empty run ID", text)
+        self.assertIn("This is Resume, never Start", text)
+        self.assertIn("Never call `controller.py init`", text)
+        self.assertNotIn("/autonomous-development:autonomous-main", text)
+        self.assertNotIn("/autonomous-development:autonomous-current", text)
+        self.assertNotIn("/autonomous-development:autonomous-feature", text)
+
+        # Commands recover from controller state with the selected run rather
+        # than relying on conversational or process-environment context.
+        prefix = (
+            'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" '
+            '--run-id "$ARGUMENTS" '
+        )
+        self.assertIn(prefix + "status --json", text)
+        self.assertIn(prefix + "next-action --json", text)
+        self.assertIn("not prior conversation", text)
+        self.assertIn("Do not discover it", text)
+        self.assertIn("${CLAUDE_PLUGIN_ROOT}/<reference>", text)
+
+        # No executable example may contain an init subcommand.
+        import re
+
+        bash_blocks = re.findall(r"```bash\n(.*?)```", text, flags=re.DOTALL)
+        self.assertTrue(bash_blocks)
+        for block in bash_blocks:
+            self.assertNotRegex(block, r"controller\.py[^\n]*\sinit(?:\s|$)")
+            for line in block.splitlines():
+                if "scripts/controller.py" in line:
+                    self.assertIn('--run-id "$ARGUMENTS"', line)
+
+    def test_start_skills_keep_their_existing_init_contract(self) -> None:
+        for name in ("autonomous-feature", "autonomous-current", "autonomous-main"):
+            text = (ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("controller.py init", text)
+            self.assertNotIn("name: autonomous-resume", text)
 
 
 if __name__ == "__main__":

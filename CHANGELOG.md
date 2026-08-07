@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Added
+- `autonomous-resume` skill: continue one explicitly identified controller run
+  after conversational context is lost, recovering from controller state and
+  never initializing or selecting another run
 - Evidence-preserving cumulative review ledger: each entry in `cumulative_findings`
   now stores the full review evidence inline (`file`, `line_start`, `description`,
   `evidence`, `recommended_fix`) plus an `origin` provenance tag

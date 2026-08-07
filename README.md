@@ -31,6 +31,12 @@ The plugin deliberately keeps Claude as the implementation orchestrator and uses
 
 Both current-checkout workflows are opt-in. They do not create `.claude/worktrees/*`, do not enter a worktree, and never commit — the user reviews with normal `git diff` and commits manually. They require a clean working tree (`git status --porcelain` must be empty): modified, staged, deleted, and untracked files all make it unclean. They also require an attached named branch; detached HEAD is unsupported. `--allow-main` is valid only with `--worktree-mode current`; `autonomous-current` refuses `main`/`master`, while `autonomous-main` passes `--allow-main` to bypass that guard.
 
+To continue an existing controller run after its Claude conversation is lost,
+invoke `/autonomous-development:autonomous-resume <run-id>`. Resume requires the
+exact run ID, reloads the recorded phase and configuration from controller
+state, and never calls `init` or selects a different active run. It is a
+separate, explicit entry point—not a Start workflow.
+
 ## Upstream
 
 This plugin is based on [quaat/autonomous-development](https://github.com/quaat/autonomous-development). This fork keeps the original workflow and adds current-checkout entry points plus configuration, safety, and integration updates documented below.
@@ -42,6 +48,7 @@ This plugin is based on [quaat/autonomous-development](https://github.com/quaat/
 | `/autonomous-development:autonomous-feature` | Safe default: run the complete workflow inside a disposable worktree |
 | `/autonomous-development:autonomous-current` | Run the complete workflow directly on the user's already-created feature branch (current checkout, never commits) |
 | `/autonomous-development:autonomous-main` | Run the complete workflow directly on `main`/`master` (explicit opt-in via `--allow-main`, never commits) |
+| `/autonomous-development:autonomous-resume <run-id>` | Resume one existing run from controller state after conversational context is lost; never initializes a run |
 | `/autonomous-development:enhance-idea` | Ask Codex to turn a rough feature idea into a structured proposal |
 | `/autonomous-development:implementation-plan` | Ask a fresh Codex execution for a repository-grounded plan |
 | `/autonomous-development:implement-plan` | Implement the accepted plan with Claude |
