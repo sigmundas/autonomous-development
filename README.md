@@ -346,6 +346,31 @@ In current mode the controller uses the current project root for both
 baseline metadata, does not create a `.claude/worktrees/*` worktree or `worktree-*` branch,
 refuses `main`/`master` unless you pass `--allow-main`, and refuses a dirty tree.
 
+## Run states
+
+Every run records a `status` field in `run-state.json`:
+
+- `active` — the controller run is still open. This does **not** prove a
+  Claude or Codex process is currently running; the controller tracks run
+  state on disk, not OS processes.
+- `complete` — all required completion gates (see [Completion rules](#completion-rules))
+  were satisfied. `evaluate` moves the run into this terminal state.
+- `blocked` — the run could not continue. The blocking reason (missing
+  credentials, unresolvable requirements conflict, verification unavailable,
+  review/fix rounds exhausted, etc.) is recorded on the run and should remain
+  recorded for later inspection.
+- `cancelled` — the user explicitly stopped the run.
+
+`archived` (see [Archiving runs](#archiving-runs)) is a separate metadata
+flag layered on top of a terminal state, not a fifth run state.
+
+Terminal or process liveness — whether a shell, Claude Code session, or
+Codex subprocess is currently alive — must be reported separately from
+`run.status`. A run marked `active` may have no live process (for example,
+the driving Claude session ended between phases), and an ended process does
+not by itself imply `blocked` or `cancelled`. Consumers that need to know
+whether work is currently in flight must observe those processes directly.
+
 ## Completion rules
 
 A run succeeds only when:
