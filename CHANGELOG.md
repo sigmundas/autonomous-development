@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+The entries in this section were inherited from the original upstream project's
+post-0.2 development history. They remain here with their original attribution
+and are not claimed as functionality first introduced by this fork.
+
 ### Added
 - Evidence-preserving cumulative review ledger: each entry in `cumulative_findings`
   now stores the full review evidence inline (`file`, `line_start`, `description`,
@@ -92,6 +96,48 @@
   artifact publication, and state save can leave `.bak` files, a missing canonical artifact,
   or artifacts newer than `run-state.json`. Hardening this with a transaction journal and
   recovery-on-load is tracked as a separate P1 item.
+
+## 0.4.0 - 2026-08-07
+
+First release of the maintained fork, based on the original
+`quaat/autonomous-development` project at revision `a72f740`. The inherited
+workflow, history, authorship, and MIT license remain attributed upstream.
+
+### Added
+
+- Versioned pre-run configuration and preset contract, including controller
+  `config-*` commands, per-phase Codex profiles/model options/reasoning settings,
+  named Claude runtimes, effective-configuration validation, and immutable
+  configuration snapshots on newly initialized runs.
+- Explicit current-checkout workflows for an existing feature branch and for
+  an intentionally selected `main`/`master` checkout. Both require a clean,
+  attached checkout and never create commits; isolated worktrees remain the
+  default workflow.
+- `autonomous-resume` skill for continuing one exact controller run after its
+  Claude conversation is lost. Resume reloads controller state and never calls
+  `init` or selects another run.
+- Human-decision pause state and continuation semantics for decisions that
+  cannot safely be inferred by the autonomous workflow.
+- Diagnostics and documentation for configuration origins, run snapshots,
+  current-checkout safety, autonomous-session permissions, and validated Azure
+  OpenAI/Codex CLI compatibility.
+
+### Changed
+
+- Controller commands and the main autonomous skill now enforce the recorded
+  workflow state: initialization, phase transitions, required actions,
+  verification, review, and completion gates cannot be skipped by conversational
+  drift.
+- Current-checkout identity, branch, cleanliness, and baseline checks fail
+  closed, including explicit opt-in before direct work on `main` or `master`.
+- The stop gate recognizes human-decision pauses without weakening controller
+  ownership of normal workflow progression.
+
+### Compatibility
+
+- Run-state remains at `schema_version` 2, with legacy schema version 1 still
+  supported. The new configuration contract is version 1 and is additive to the
+  persisted run-state schema.
 
 ## 0.2.0 - 2026-06-12
 

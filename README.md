@@ -21,11 +21,34 @@ The main entry point is:
 
 The plugin deliberately keeps Claude as the implementation orchestrator and uses fresh, read-only Codex executions for independent planning and review. It does not push, merge, deploy, rotate credentials, alter remote infrastructure, or apply irreversible production migrations.
 
+### Three entry-point workflows
+
+| Slash command | Worktree | Branch | When to use |
+|---|---|---|---|
+| `/autonomous-development:autonomous-feature` | Isolated `.claude/worktrees/*` (default safe) | New worktree branch | Default. Edits land in a disposable worktree; your checkout is untouched. |
+| `/autonomous-development:autonomous-current` | Current checkout | Your already-created non-`main`/`master` feature branch | You created and switched to a clean feature branch yourself and want changes to land there. |
+| `/autonomous-development:autonomous-main` | Current checkout | `main` / `master` (explicit opt-in via `--allow-main`) | You explicitly want direct edits on `main`/`master`. Still requires a clean tree. |
+
+Both current-checkout workflows are opt-in. They do not create `.claude/worktrees/*`, do not enter a worktree, and never commit — the user reviews with normal `git diff` and commits manually. They require a clean working tree (`git status --porcelain` must be empty): modified, staged, deleted, and untracked files all make it unclean. They also require an attached named branch; detached HEAD is unsupported. `--allow-main` is valid only with `--worktree-mode current`; `autonomous-current` refuses `main`/`master`, while `autonomous-main` passes `--allow-main` to bypass that guard.
+
+To continue an existing controller run after its Claude conversation is lost,
+invoke `/autonomous-development:autonomous-resume <run-id>`. Resume requires the
+exact run ID, reloads the recorded phase and configuration from controller
+state, and never calls `init` or selects a different active run. It is a
+separate, explicit entry point—not a Start workflow.
+
+## Upstream
+
+This plugin is based on [quaat/autonomous-development](https://github.com/quaat/autonomous-development). This fork keeps the original workflow and adds current-checkout entry points plus configuration, safety, and integration updates documented below.
+
 ## Included skills
 
 | Skill | Purpose |
 |---|---|
-| `/autonomous-development:autonomous-feature` | Run the complete workflow from a high-level idea |
+| `/autonomous-development:autonomous-feature` | Safe default: run the complete workflow inside a disposable worktree |
+| `/autonomous-development:autonomous-current` | Run the complete workflow directly on the user's already-created feature branch (current checkout, never commits) |
+| `/autonomous-development:autonomous-main` | Run the complete workflow directly on `main`/`master` (explicit opt-in via `--allow-main`, never commits) |
+| `/autonomous-development:autonomous-resume <run-id>` | Resume one existing run from controller state after conversational context is lost; never initializes a run |
 | `/autonomous-development:enhance-idea` | Ask Codex to turn a rough feature idea into a structured proposal |
 | `/autonomous-development:implementation-plan` | Ask a fresh Codex execution for a repository-grounded plan |
 | `/autonomous-development:implement-plan` | Implement the accepted plan with Claude |
@@ -64,6 +87,66 @@ npm install -g @openai/codex
 codex login
 ```
 
+### Azure OpenAI / Codex CLI compatibility
+
+The Azure-backed autonomous profile `azure-gpt5p6-sol` (model
+`gpt-5.6-sol`, `wire_api = "responses"`) is validated with **codex-cli
+0.146.1**. The controller and VS Code extension profile wiring are correct;
+the compatibility constraint is in the upstream Codex CLI/provider request.
+
+Do not use codex-cli 0.147.0 with this Azure setup. The incompatibility was
+reproduced with the Homebrew 0.147.0 build: that release sends an empty
+description for the Responses Lite `functions` tool namespace, which Azure
+rejects with:
+
+```text
+Invalid 'input[0].tools[0].description': empty string.
+```
+
+The visible model-catalog warning is a separate, non-fatal condition. Azure's
+`/openai/v1/models` endpoint returns an OpenAI-style `{ "object": "list",
+"data": [...] }` response, while the Codex model manager also attempts to
+decode another catalog schema. In 0.146.1 the refresh warning may be large, but
+Codex falls back to its bundled catalog and continues successfully. Do not
+treat that warning alone as a failed invocation. A bundled
+`0.147.0-alpha.6.5` pre-release was also observed to work, but extension-bundled
+or pre-release binaries are not a supported workaround.
+
+Until a later upstream Codex release fixes the Azure empty-description
+incompatibility, pin or downgrade Codex using the installation method you
+manage locally. For example, npm users can select the validated version with:
+
+```bash
+npm install -g @openai/codex@0.146.1
+codex --version
+# codex-cli 0.146.1
+```
+
+Verify the configured profile independently of the controller:
+
+```bash
+codex exec --ephemeral --json --sandbox read-only \
+  --profile azure-gpt5p6-sol \
+  -c model_reasoning_effort=high \
+  -c model_reasoning_summary=none \
+  -c model_verbosity=low \
+  'Return exactly OK.'
+```
+
+Success means an `item.completed` event with text `OK`, followed by
+`turn.completed` and exit code 0. The model-catalog warning may still appear.
+The regression was narrowed to upstream Codex Responses Lite tool
+canonicalization introduced between 0.146.1 and 0.147.0 (see upstream commit
+[`f21dc463`](https://github.com/openai/codex/commit/f21dc4638803f40046c9e294b0349782928f6b36)).
+
+`controller.py doctor` currently checks that Codex is installed and reports
+its version; it does not execute a live request against the selected provider.
+It can therefore report Codex as ready even when the first real invocation is
+provider-incompatible. Also note that controller failure diagnostics emphasize
+stderr: in this incident the non-fatal catalog warning was on stderr, while the
+fatal Azure API response was in Codex's stdout NDJSON. Use the direct minimal
+test above when diagnosing this distinction.
+
 The official OpenAI Codex plugin for Claude Code is optional for this project because the workflow invokes `codex exec` directly to obtain schema-validated output. It remains useful for manual `/codex:*` commands:
 
 ```text
@@ -93,6 +176,12 @@ For development validation:
 make check
 claude plugin validate . --strict
 ```
+
+### Human decision pauses
+
+A run may pause when it genuinely requires a human decision it cannot safely
+infer on its own. After you supply the decision, the run can continue from
+where it paused.
 
 ## Adaptive workflow modes
 
@@ -286,19 +375,75 @@ Archiving is a metadata flag; no files are deleted.
 - Do not share state directories across users or store them on world-readable paths.
 - Remote URLs are stored with credentials stripped (the `user:pass@` portion is removed).
 
-## Worktree support
+## Worktree modes
 
-All commands work correctly from any linked worktree. The repository identity is derived from
-the shared git object store so runs created in different worktrees belong to the same
-repository and are visible to `list-runs`.
+The controller supports two explicit execution modes:
 
 ```bash
-# Create a linked worktree and run the workflow there
-git worktree add ../experiment feature-branch
-cd ../experiment
-controller.py init --feature "Experiment feature"
-# State stored under the same repository ID, new run ID
+# Default safe workflow: isolated worktree
+# Claude Code's autonomous-feature skill enters a disposable worktree before init.
+controller.py init --feature "Experiment feature" --mode auto --worktree-mode isolated
 ```
+
+```bash
+# Current-branch workflow: use the branch you created manually
+git checkout -b experiment
+controller.py init --feature "Experiment feature" --mode auto --worktree-mode current
+# Review the result with normal `git diff` in your checkout.
+```
+
+```bash
+# Current-checkout on main/master (explicit opt-in):
+controller.py init --feature "Hotfix" --mode standard --worktree-mode current --allow-main
+```
+
+Two slash commands wrap these invocations so the user does not have to call `controller.py`
+directly:
+
+```text
+/autonomous-development:autonomous-current "Experiment feature"   # already on a feature branch
+/autonomous-development:autonomous-main "Hotfix"                  # explicit edits on main/master
+```
+
+Both commands run `controller.py init --mode standard --worktree-mode current`; the `main`
+variant additionally passes `--allow-main`. Neither creates `.claude/worktrees/*`, neither
+enters a worktree, and neither commits. The agent's changes land directly in your checkout so
+normal `git diff`, local testing, and manual commit flow continue to work.
+
+All commands still work correctly from any linked worktree. The repository identity is derived
+from the shared git object store so runs created in different worktrees belong to the same
+repository and are visible to `list-runs`. Current-checkout mode is opt-in for people who create
+their own feature branches first and want the agent's changes to land directly in that checkout.
+In current mode the controller uses the current project root for both
+`repository.canonical_root` and `repository.worktree_path`, records the current branch in
+baseline metadata, does not create a `.claude/worktrees/*` worktree or `worktree-*` branch,
+refuses detached HEAD and `main`/`master` unless you pass `--allow-main`, and refuses a
+dirty tree containing modified, staged, deleted, or untracked files.
+
+## Run states
+
+Every run records a `status` field in `run-state.json`:
+
+- `active` — the controller run is still open. This does **not** prove a
+  Claude or Codex process is currently running; the controller tracks run
+  state on disk, not OS processes.
+- `complete` — all required completion gates (see [Completion rules](#completion-rules))
+  were satisfied. `evaluate` moves the run into this terminal state.
+- `blocked` — the run could not continue. The blocking reason (missing
+  credentials, unresolvable requirements conflict, verification unavailable,
+  review/fix rounds exhausted, etc.) is recorded on the run and should remain
+  recorded for later inspection.
+- `cancelled` — the user explicitly stopped the run.
+
+`archived` (see [Archiving runs](#archiving-runs)) is a separate metadata
+flag layered on top of a terminal state, not a fifth run state.
+
+Terminal or process liveness — whether a shell, Claude Code session, or
+Codex subprocess is currently alive — must be reported separately from
+`run.status`. A run marked `active` may have no live process (for example,
+the driving Claude session ended between phases), and an ended process does
+not by itself imply `blocked` or `cancelled`. Consumers that need to know
+whether work is currently in flight must observe those processes directly.
 
 ## Completion rules
 
@@ -323,7 +468,7 @@ The skill uses Codex with `--sandbox read-only`. Claude performs repository edit
 - deleting unrelated user changes;
 - weakening tests or security controls to obtain a passing result.
 
-Run autonomous development in a disposable branch or worktree. The orchestrator asks Claude Code to use an isolated worktree whenever supported.
+By default, run autonomous development in an isolated worktree. This fork also supports an explicit current-checkout mode when you want changes to land directly in your own feature branch.
 
 ## Customization
 

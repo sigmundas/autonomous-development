@@ -165,7 +165,15 @@ def main() -> int:
     if state.get("status") in TERMINAL_STATUSES:
         return 0
 
-    # Step 5: enforce bounded block counter
+    # Step 5: skip if the run is explicitly awaiting a genuine human decision.
+    # Claude marks this via `controller.py await-decision` before stopping for
+    # user input; the Stop hook must NOT automatically force the next controller
+    # action and override that decision point. Automatic continuation resumes
+    # for non-decision stops on the next Stop event.
+    if state.get("awaiting_human_decision") is True:
+        return 0
+
+    # Step 6: enforce bounded block counter
     return _block_and_exit(run_dir)
 
 

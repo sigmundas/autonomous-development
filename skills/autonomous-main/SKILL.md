@@ -1,6 +1,6 @@
 ---
-name: autonomous-feature
-description: Autonomously develop a repository feature from a high-level idea. Codex independently enhances the idea, proposes a detailed plan, and reviews the implementation while Claude reconciles requirements, implements, verifies, triages findings, and fixes valid issues. Use when the user delegates an end-to-end feature change.
+name: autonomous-main
+description: Autonomously develop a repository feature directly in the current main/master checkout. Use only when the user has explicitly authorized direct edits on main/master. Same workflow as autonomous-current but passes --allow-main to bypass the main/master refusal. Still requires a clean working tree and never commits.
 argument-hint: "[feature idea]"
 disable-model-invocation: true
 effort: high
@@ -12,13 +12,13 @@ allowed-tools:
   - Write
   - LSP
   - Agent
-  - EnterWorktree
-  - ExitWorktree
   - Bash(git *)
   - Bash(python3 *)
   - Bash(codex *)
 disallowed-tools:
   - AskUserQuestion
+  - EnterWorktree
+  - ExitWorktree
 hooks:
   Stop:
     - hooks:
@@ -27,15 +27,18 @@ hooks:
           timeout: 10
 ---
 
-# Autonomous feature development
+# Autonomous feature development — current checkout on main
 
-Implement this feature idea:
+Implement this feature idea directly in the user's current checkout, including when the
+current branch is `main` or `master`:
 
 > $ARGUMENTS
 
-Use ultrathink for architecture, compatibility, and review triage. Operate as a state-machine
-driver: ask the controller what to do next, execute that phase, repeat. Detailed per-phase guidance
-lives in `references/` and is loaded only when a phase needs it.
+This is the explicit-opt-in variant of `autonomous-current`. By invoking this skill the user has
+acknowledged that the agent's edits will land directly in `main`/`master`. Prefer
+`autonomous-feature` (isolated worktree) or `autonomous-current` (clean feature branch) when
+either is appropriate; this skill exists for cases where the user really does want changes in
+the current `main`/`master` checkout.
 
 ## Non-negotiable boundaries
 
@@ -56,8 +59,18 @@ lives in `references/` and is loaded only when a phase needs it.
   redirected or chained wrapper.
 - **Terminate only on a controller-authorized state.** Stop when the controller reports the run
   as `complete`, `blocked`, `cancelled`, or when you have explicitly marked it awaiting a genuine
-  human decision via `controller.py await-decision --reason "..."`. Do not otherwise decide the
-  workflow is finished.
+  human decision (see below). Do not otherwise decide the workflow is finished.
+- **Genuine human decisions must be recorded before stopping.** If you actually need the user to
+  resolve an ambiguity or authorize a step that only they can decide, first mark the run as
+  awaiting that decision:
+
+  ```bash
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" await-decision \
+    --reason "specific question the user must answer"
+  ```
+
+  The Stop hook respects this state and will not force the next controller action. When the user
+  answers, the workflow calls `controller.py resume` and continues from `next-action`.
 
   **When `await-decision` may / may not be used.** `await-decision` is NOT a general stopping
   mechanism. It may be used ONLY when continued execution genuinely requires one of:
@@ -83,6 +96,12 @@ lives in `references/` and is loaded only when a phase needs it.
   `stop`, `stopping`, `pausing`, `taking a break`, `need input`, `unclear`,
   `human decision needed`, `too hard`, `too big`, `too long`, `low priority`. A fuller sentence
   that merely contains one of these words is fine — only the whole reason is compared.
+- This skill must NOT call `EnterWorktree` / `ExitWorktree`. All edits land in the current
+  checkout. Do not create or enter `.claude/worktrees/*`.
+- Require a clean working tree. `git status --porcelain` must be empty before initializing. If
+  it is not, stop and report which entries are dirty.
+- Do not create commits. The user will review and commit with their normal `git diff`/commit
+  flow.
 - Preserve unrelated user changes.
 - Never push, merge, publish, deploy, rotate credentials, or modify remote infrastructure.
 - Never use `danger-full-access`, `--yolo`, `bypassPermissions`, or equivalent unrestricted modes.
@@ -91,35 +110,30 @@ lives in `references/` and is loaded only when a phase needs it.
 - Codex planning and review executions must remain read-only.
 - Use no more than the configured review-round budget.
 - Treat every Codex finding as a proposal requiring evidence-based triage.
-- Do not create commits unless the user explicitly requested them.
 
-## Driver loop
+## Required driver loop
+
+Every invocation of this skill runs the controller loop below. There is no fast path, no
+"documentation-only" shortcut, no "this task is too small" bypass. The controller and its
+configured mode decide which phases apply.
 
 1. Confirm this is a Git repository. Inspect `CLAUDE.md`, repository instructions, architecture,
-   status, and tests. Use `EnterWorktree` for an isolated worktree whenever available — mandatory
-   when the starting worktree has uncommitted changes. If the user explicitly asks for
-   current-checkout mode, stay in the current branch instead of entering a worktree, and require a
-   clean feature branch before proceeding.
-2. Initialize:
+   status, and tests. Verify the working tree is clean before initializing.
+
+2. Initialize in current-checkout mode on main/master:
 
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" doctor
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" init --feature "$ARGUMENTS" --mode auto --worktree-mode isolated
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" init \
+     --feature "$ARGUMENTS" \
+     --mode standard \
+     --worktree-mode current \
+     --allow-main
    ```
 
    `init` prints the `run-state.json` path and run ID. With multiple concurrent runs, pass
-   `--run-id <run-id>` to all subsequent commands. If `doctor` reports a missing prerequisite, mark
-   the run blocked and report it rather than bypassing it.
-
-   For current-checkout mode, do not call `EnterWorktree`. Instead, keep the current branch checked
-   out and run:
-
-   ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" init --feature "$ARGUMENTS" --mode auto --worktree-mode current
-   ```
-
-   The controller refuses `main`/`master` unless the user also passes `--allow-main`, and it
-   refuses a dirty tree in current-checkout mode.
+   `--run-id <run-id>` to all subsequent commands. If `doctor` reports a missing prerequisite,
+   mark the run blocked and report it rather than bypassing it.
 
 3. Repeatedly ask the controller for the next phase, then execute it:
 
@@ -127,15 +141,9 @@ lives in `references/` and is loaded only when a phase needs it.
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" next-action --json
    ```
 
-   The response gives `phase`, `required_action`, `completion_condition`, and `references`. Read the
-   referenced file under `references/` for that phase and follow it until the completion condition
-   holds. Phase references:
-
-   - `references/specification.md` — produce the accepted spec.
-   - `references/planning.md` — produce the accepted plan and set the risk gate.
-   - `references/implementation.md` — implement the plan.
-   - `references/verification.md` — run and record checks.
-   - `references/review.md` — Codex review, triage, and adversarial review.
+   The response gives `phase`, `required_action`, `completion_condition`, and `references`.
+   Read the referenced file under `${CLAUDE_PLUGIN_ROOT}/skills/autonomous-feature/references/`
+   for that phase and follow it until the completion condition holds.
 
 4. Do not declare success until `evaluate` succeeds:
 
@@ -148,10 +156,11 @@ lives in `references/` and is loaded only when a phase needs it.
 ## Final report
 
 - the implemented behavior;
-- principal files changed;
+- principal files changed (visible to the user via plain `git diff`);
 - verification commands and results;
 - Codex review rounds and disposition of findings;
-- adversarial review result when required;
+- adversarial review result when one was required;
 - per-phase usage table from `usage-report`;
 - remaining risks or explicit blocked reason;
-- a suggested conventional commit message.
+- a suggested conventional commit message (the user commits manually — this skill must not
+  commit).
