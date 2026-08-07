@@ -1666,6 +1666,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "max_review_rounds": args.max_review_rounds,
                 "review_round": 0,
                 "stop_gate_blocks": 0,
+                "awaiting_human_decision": False,
                 "artifacts": {
                     "feature_request": "feature-request.md",
                     "repository_context": "repository-context.txt",
@@ -2684,6 +2685,148 @@ def cmd_set_phase(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# cmd_await_decision / cmd_resume
+# ---------------------------------------------------------------------------
+
+
+# `await-decision` is NOT a general stopping mechanism. It may be used only
+# when continued execution genuinely requires a specific human choice,
+# authorization, or missing fact that cannot be safely inferred. The reason
+# must state the concrete decision required — not a general "need input" or
+# "unclear next step", and not a complaint that the task is difficult,
+# lengthy, or low priority. The controller enforces this with two mechanical
+# sanity checks (no semantic AI-judgement is performed):
+#
+#   1. Minimum length after strip. Anything shorter than
+#      ``_AWAIT_DECISION_MIN_REASON_LEN`` characters cannot describe a
+#      concrete decision.
+#   2. Case-insensitive whole-phrase denylist. Any reason whose ENTIRE
+#      stripped body (lowercased) equals one of the phrases in
+#      ``_AWAIT_DECISION_GENERIC_REASON_DENYLIST`` is rejected as a generic
+#      placeholder. This is exact-phrase matching against the whole reason,
+#      NOT substring matching — a legitimate fuller sentence that merely
+#      contains one of these words is accepted (e.g. "user must choose
+#      license — this is unclear from the code" is fine because the reason
+#      as a whole is not "unclear").
+_AWAIT_DECISION_MIN_REASON_LEN = 12
+
+_AWAIT_DECISION_GENERIC_REASON_DENYLIST = frozenset(
+    {
+        "stop",
+        "stopping",
+        "pausing",
+        "taking a break",
+        "need input",
+        "unclear",
+        "human decision needed",
+        "too hard",
+        "too big",
+        "too long",
+        "low priority",
+    }
+)
+
+_AWAIT_DECISION_CONTRACT_HINT = (
+    "`await-decision` may be used only when the run genuinely requires a "
+    "specific human choice, an authorization only the user can grant, or a "
+    "missing fact that cannot be safely inferred; the --reason must state "
+    "that concrete decision. It must NOT be used because the task is "
+    "difficult, ambiguous-but-inferable, lengthy, low priority, or because "
+    "the model prefers to stop."
+)
+
+
+def cmd_await_decision(args: argparse.Namespace) -> int:
+    """Mark the active run as awaiting a genuine human decision.
+
+    While this flag is set the automatic Stop hook must not force the next
+    controller action, so a legitimate stop for user input is preserved. The
+    run remains `active` — this is not a terminal state. Clear it with
+    ``resume`` when the workflow is ready to continue.
+
+    The ``--reason`` is validated by two explicit sanity checks (no semantic
+    judgement): it must be at least ``_AWAIT_DECISION_MIN_REASON_LEN``
+    characters after strip, and its entire lowercased body must not equal
+    any phrase in ``_AWAIT_DECISION_GENERIC_REASON_DENYLIST``. See the
+    module-level comment above for the full contract.
+    """
+    repo, state_home, run_id_override = get_context(args)
+    run_ref = resolve_run_for_active_mutation(
+        state_home,
+        repo.id,
+        repo.canonical_root,
+        run_id_override,
+        operation="await-decision",
+    )
+    run_dir = run_ref.run_dir
+    reason = args.reason.strip()
+    if not reason:
+        raise WorkflowError(
+            "await-decision requires a non-empty --reason so the human decision "
+            "point is auditable."
+        )
+    lowered = reason.lower()
+    if lowered in _AWAIT_DECISION_GENERIC_REASON_DENYLIST:
+        raise WorkflowError(
+            f"await-decision --reason {reason!r} is a generic placeholder and "
+            "does not describe a concrete human-decision point. "
+            + _AWAIT_DECISION_CONTRACT_HINT
+        )
+    if len(reason) < _AWAIT_DECISION_MIN_REASON_LEN:
+        raise WorkflowError(
+            f"await-decision --reason must be at least "
+            f"{_AWAIT_DECISION_MIN_REASON_LEN} characters after strip so the "
+            f"concrete decision is auditable; got {len(reason)} character(s): "
+            f"{reason!r}. "
+            + _AWAIT_DECISION_CONTRACT_HINT
+        )
+    with RunStateLock(run_dir):
+        state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
+        require_active_run_state(state, run_ref.run_id, "await-decision")
+        require_no_unsafe_drift(state, repo)
+        state["awaiting_human_decision"] = True
+        state["awaiting_human_decision_reason"] = reason
+        # Also reset the Stop hook block counter so a prior automatic-continue
+        # streak doesn't spill into the pause. When the user later resumes and
+        # normal continuation resumes, the counter starts fresh.
+        state["stop_gate_blocks"] = 0
+        state.setdefault("notes", []).append(f"awaiting human decision: {reason}")
+        save_run_state(run_dir, state)
+    print(json.dumps({"awaiting_human_decision": True, "reason": reason}))
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Clear an ``awaiting_human_decision`` marker so the workflow can proceed."""
+    repo, state_home, run_id_override = get_context(args)
+    run_ref = resolve_run_for_active_mutation(
+        state_home,
+        repo.id,
+        repo.canonical_root,
+        run_id_override,
+        operation="resume",
+    )
+    run_dir = run_ref.run_dir
+    with RunStateLock(run_dir):
+        state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
+        require_active_run_state(state, run_ref.run_id, "resume")
+        require_no_unsafe_drift(state, repo)
+        was_awaiting = bool(state.get("awaiting_human_decision"))
+        state["awaiting_human_decision"] = False
+        # Preserve the reason for audit, but clear the live-blocker field so
+        # `status --json` reads unambiguously.
+        state.pop("awaiting_human_decision_reason", None)
+        if args.note:
+            state.setdefault("notes", []).append(args.note)
+        state["stop_gate_blocks"] = 0
+        save_run_state(run_dir, state)
+    print(json.dumps({"awaiting_human_decision": False, "was_awaiting": was_awaiting}))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # cmd_set_risk
 # ---------------------------------------------------------------------------
 
@@ -3387,6 +3530,26 @@ def compute_next_action(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
             "references": [],
         }
 
+    # A genuine human decision pause is not a terminal state, but the workflow
+    # cannot advance until the human answers and `resume` is called. Surface
+    # this so `next-action` reports the pause instead of the next phase.
+    if state.get("awaiting_human_decision") is True:
+        reason = state.get("awaiting_human_decision_reason") or ""
+        action = (
+            "Run is awaiting a human decision; "
+            "call `controller.py resume` after the user answers."
+        )
+        if reason:
+            action = f"{action} Reason: {reason}"
+        return {
+            "phase": "awaiting-human-decision",
+            "required_action": action,
+            "completion_condition": (
+                "User answers the decision point; `resume` clears the pause."
+            ),
+            "references": [],
+        }
+
     if not have("accepted_spec", "accepted-spec.md"):
         if mode == "rigorous" and "enhance" not in artifacts:
             return {
@@ -3785,6 +3948,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     risk.add_argument("--reason")
     risk.set_defaults(func=cmd_set_risk)
+
+    await_decision = sub.add_parser(
+        "await-decision",
+        help=(
+            "Mark the active run as awaiting a genuine human decision. The Stop "
+            "hook will not force the next controller action while this flag is "
+            "set. Clear it with `resume` when the workflow is ready to continue. "
+            "May be used ONLY for a specific human choice, an authorization only "
+            "the user can grant, or a missing fact that cannot be safely "
+            "inferred — never because a task is hard, lengthy, or low priority."
+        ),
+    )
+    await_decision.add_argument(
+        "--reason",
+        required=True,
+        help=(
+            "Concrete description of the decision the human must make. Must "
+            "state the specific choice/authorization/missing fact, not a "
+            "generic placeholder like 'unclear' or 'need input'. Minimum "
+            f"{_AWAIT_DECISION_MIN_REASON_LEN} characters after strip; a small "
+            "denylist of generic phrases is rejected."
+        ),
+    )
+    await_decision.set_defaults(func=cmd_await_decision)
+
+    resume = sub.add_parser(
+        "resume",
+        help="Clear an awaiting_human_decision marker set by `await-decision`.",
+    )
+    resume.add_argument(
+        "--note",
+        help="Optional note recorded when resuming (e.g., 'user chose option A').",
+    )
+    resume.set_defaults(func=cmd_resume)
 
     evaluate = sub.add_parser("evaluate", help="Evaluate all completion gates")
     evaluate.set_defaults(func=cmd_evaluate)

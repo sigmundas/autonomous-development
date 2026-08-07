@@ -2887,5 +2887,762 @@ class EvidencePreservingReviewTests(unittest.TestCase):
         self.assertEqual(blocked_ids, {"AC-2", "AC-3", "AC-4"})
 
 
+class ControllerAlwaysEnforcedTests(unittest.TestCase):
+    """Guardrail tests for the /autonomous-current controller-first contract.
+
+    The observed bug was Claude bypassing the controller for a "documentation
+    only" task. These tests protect against a regression along two axes:
+
+    1. `next-action` produces a full workflow (specification -> planning ->
+       verification -> review) even for tiny documentation-shaped tasks.
+    2. The configured/snapshotted workflow mode is preserved and task
+       complexity does not silently select a different mode.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdirs: list[Path] = []
+
+    def tearDown(self) -> None:
+        for d in self._tmpdirs:
+            if d.exists():
+                shutil.rmtree(str(d), ignore_errors=True)
+
+    def _make_repo(self) -> Path:
+        temp = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(temp)
+        subprocess.run(["git", "init", "-q", str(temp)], check=True)
+        subprocess.run(
+            ["git", "-C", str(temp), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(temp), "config", "user.name", "Test User"], check=True
+        )
+        (temp / "README.md").write_text("# Test\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(temp), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(temp), "commit", "-qm", "initial"], check=True)
+        return temp
+
+    def _make_state_home(self) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(d)
+        return d
+
+    def _run_controller(
+        self, repo: Path, *args: str, state_home: Path
+    ) -> subprocess.CompletedProcess[str]:
+        cmd = [
+            "python3",
+            str(CONTROLLER),
+            "--project-root",
+            str(repo),
+            "--state-dir",
+            str(state_home),
+            *args,
+        ]
+        return subprocess.run(
+            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+
+    def _find_state_path(self, repo: Path, state_home: Path) -> Path:
+        repo_info = resolve_repository(repo)
+        active = find_active_runs(state_home, repo_info.id)
+        if not active:
+            raise AssertionError(
+                f"No active runs found in {state_home} for repo {repo_info.id}"
+            )
+        return active[0].run_dir / "run-state.json"
+
+    def test_small_documentation_task_still_enters_controller_workflow(self) -> None:
+        """A tiny documentation-only feature idea must still route through the
+        full controller state machine (specification -> planning -> ...).
+        There is no controller path that lets Claude skip phases based on
+        task size."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        init = self._run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Fix a typo in the README",
+            "--mode",
+            "standard",
+            state_home=state_home,
+        )
+        self.assertEqual(init.returncode, 0, init.stderr)
+        # The controller must produce an initialized active run with the
+        # requested mode preserved.
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["status"], "active")
+        self.assertEqual(state["phase"], "initialized")
+        self.assertEqual(state["requested_mode"], "standard")
+        self.assertEqual(state["effective_mode"], "standard")
+        # next-action must direct through the standard workflow starting at
+        # specification, even for a documentation-only task.
+        na = self._run_controller(repo, "next-action", state_home=state_home)
+        self.assertEqual(na.returncode, 0, na.stderr)
+        payload = json.loads(na.stdout)
+        self.assertEqual(payload["phase"], "specification")
+        self.assertIn("accepted-spec.md", payload["completion_condition"])
+
+    def test_configured_standard_mode_is_respected(self) -> None:
+        """`--mode standard` must persist through init and be used by
+        `next-action` (rigorous mode's enhance phase must not appear)."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        result = self._run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Improve a small helper docstring",
+            "--mode",
+            "standard",
+            state_home=state_home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["effective_mode"], "standard")
+        self.assertEqual(state["mode_origin"], "cli")
+        # standard's specification phase must NOT be the rigorous 'enhance' step.
+        na = self._run_controller(repo, "next-action", state_home=state_home)
+        payload = json.loads(na.stdout)
+        self.assertEqual(payload["phase"], "specification")
+        self.assertNotIn(
+            "codex --phase enhance", payload["required_action"],
+            "standard mode must not route through the rigorous enhance step",
+        )
+
+    def test_configured_lean_mode_is_respected(self) -> None:
+        """`--mode lean` must persist and lean's lighter specification/planning
+        actions must be surfaced by `next-action` — but every phase still runs
+        through the controller."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        result = self._run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Add a paragraph to CONTRIBUTING.md",
+            "--mode",
+            "lean",
+            state_home=state_home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["effective_mode"], "lean")
+        self.assertFalse(state["risk"]["requires_adversarial_review"])
+        na = self._run_controller(repo, "next-action", state_home=state_home)
+        payload = json.loads(na.stdout)
+        # lean still enters the controller's specification phase — it is the
+        # phased action that is lighter, not the presence of the phase.
+        self.assertEqual(payload["phase"], "specification")
+        self.assertIn("concise", payload["required_action"].lower())
+
+    def test_task_complexity_does_not_silently_select_a_different_mode(
+        self,
+    ) -> None:
+        """A tiny task must produce the same explicit mode as a large one when
+        the mode is passed explicitly. Task complexity must not override the
+        configured mode."""
+        state_home = self._make_state_home()
+        tiny_repo = self._make_repo()
+        big_repo = self._make_repo()
+        self._run_controller(
+            tiny_repo,
+            "init",
+            "--feature",
+            "Fix a typo",
+            "--mode",
+            "standard",
+            state_home=state_home,
+        )
+        self._run_controller(
+            big_repo,
+            "init",
+            "--feature",
+            (
+                "Rewrite the persistence layer to switch database engines and "
+                "migrate all historical data end to end"
+            ),
+            "--mode",
+            "standard",
+            state_home=state_home,
+        )
+        tiny_state = json.loads(
+            self._find_state_path(tiny_repo, state_home).read_text(encoding="utf-8")
+        )
+        big_state = json.loads(
+            self._find_state_path(big_repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertEqual(tiny_state["effective_mode"], "standard")
+        self.assertEqual(big_state["effective_mode"], "standard")
+        self.assertEqual(tiny_state["mode_origin"], "cli")
+        self.assertEqual(big_state["mode_origin"], "cli")
+
+    def test_terminal_controller_states_stop_continuation(self) -> None:
+        """Once the controller reports a terminal state (complete/blocked/
+        cancelled), `next-action` must surface that terminal phase and the
+        Stop hook must not force further action."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", "--mode", "standard", state_home=state_home
+        )
+        # Cancel the run so it becomes terminal.
+        cancel = self._run_controller(
+            repo, "cancel", "--reason", "user aborted", state_home=state_home
+        )
+        self.assertEqual(cancel.returncode, 0, cancel.stderr)
+        na = self._run_controller(repo, "next-action", state_home=state_home)
+        payload = json.loads(na.stdout)
+        self.assertEqual(payload["phase"], "cancelled")
+        self.assertIn("no further action", payload["required_action"])
+        # And the automatic Stop hook must not block on a terminal run.
+        payload_str = json.dumps({"cwd": str(repo), "hook_event_name": "Stop"})
+        env = {**os.environ, "CLAUDE_AUTONOMOUS_STATE_HOME": str(state_home)}
+        result = subprocess.run(
+            ["python3", str(STOP_GATE)],
+            input=payload_str,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+
+class AwaitingHumanDecisionTests(unittest.TestCase):
+    """Cover the human-decision pause contract.
+
+    Claude marks the run as awaiting a genuine human decision via
+    `controller.py await-decision`. The Stop hook must respect that marker and
+    NOT force the next controller action, while non-decision stops on other
+    active runs still get the automatic continuation.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdirs: list[Path] = []
+
+    def tearDown(self) -> None:
+        for d in self._tmpdirs:
+            if d.exists():
+                shutil.rmtree(str(d), ignore_errors=True)
+
+    def _make_repo(self) -> Path:
+        temp = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(temp)
+        subprocess.run(["git", "init", "-q", str(temp)], check=True)
+        subprocess.run(
+            ["git", "-C", str(temp), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(temp), "config", "user.name", "Test User"], check=True
+        )
+        (temp / "README.md").write_text("# Test\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(temp), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(temp), "commit", "-qm", "initial"], check=True)
+        return temp
+
+    def _make_state_home(self) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(d)
+        return d
+
+    def _run_controller(
+        self, repo: Path, *args: str, state_home: Path
+    ) -> subprocess.CompletedProcess[str]:
+        cmd = [
+            "python3",
+            str(CONTROLLER),
+            "--project-root",
+            str(repo),
+            "--state-dir",
+            str(state_home),
+            *args,
+        ]
+        return subprocess.run(
+            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+
+    def _find_state_path(self, repo: Path, state_home: Path) -> Path:
+        repo_info = resolve_repository(repo)
+        active = find_active_runs(state_home, repo_info.id)
+        return active[0].run_dir / "run-state.json"
+
+    def _invoke_stop_hook(
+        self, repo: Path, state_home: Path
+    ) -> subprocess.CompletedProcess[str]:
+        payload_str = json.dumps({"cwd": str(repo), "hook_event_name": "Stop"})
+        env = {**os.environ, "CLAUDE_AUTONOMOUS_STATE_HOME": str(state_home)}
+        return subprocess.run(
+            ["python3", str(STOP_GATE)],
+            input=payload_str,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+
+    def test_init_seeds_awaiting_human_decision_false(self) -> None:
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        result = self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertIn("awaiting_human_decision", state)
+        self.assertFalse(state["awaiting_human_decision"])
+
+    def test_await_decision_sets_flag_and_reason(self) -> None:
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        result = self._run_controller(
+            repo,
+            "await-decision",
+            "--reason",
+            "user must choose format A or B",
+            state_home=state_home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertTrue(state["awaiting_human_decision"])
+        self.assertEqual(
+            state["awaiting_human_decision_reason"],
+            "user must choose format A or B",
+        )
+        # Run stays active — this is not a terminal state.
+        self.assertEqual(state["status"], "active")
+
+    def test_await_decision_requires_non_empty_reason(self) -> None:
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        result = self._run_controller(
+            repo, "await-decision", "--reason", "   ", state_home=state_home
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-empty --reason", result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertFalse(state["awaiting_human_decision"])
+
+    def test_stop_gate_respects_awaiting_human_decision(self) -> None:
+        """Stop hook must NOT block or mutate state while the run is awaiting a
+        human decision. That's the whole point of the pause — Claude must be
+        allowed to genuinely stop for the user."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        self._run_controller(
+            repo,
+            "await-decision",
+            "--reason",
+            "user must resolve ambiguity",
+            state_home=state_home,
+        )
+        state_path = self._find_state_path(repo, state_home)
+        before = state_path.read_bytes()
+        # Fire the Stop hook multiple times — none should block or mutate.
+        for _ in range(5):
+            result = self._invoke_stop_hook(repo, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_stop_gate_still_forces_continuation_on_non_decision_stop(
+        self,
+    ) -> None:
+        """Automatic continuation must still work for non-decision stops.
+        The awaiting-decision fix must not silently disable the automatic
+        stop-hook block behavior for normal active runs."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        # No await-decision call — this is a plain active run.
+        result = self._invoke_stop_hook(repo, state_home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # A block decision must be emitted so the workflow keeps moving.
+        self.assertIn('"decision": "block"', result.stdout)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        # Counter incremented — this proves the hook did fire on this run.
+        self.assertEqual(state.get("stop_gate_blocks"), 1)
+
+    def test_resume_clears_awaiting_human_decision(self) -> None:
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        self._run_controller(
+            repo,
+            "await-decision",
+            "--reason",
+            "user must choose option A or option B for the new integration",
+            state_home=state_home,
+        )
+        result = self._run_controller(
+            repo,
+            "resume",
+            "--note",
+            "user chose option A",
+            state_home=state_home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertFalse(state["awaiting_human_decision"])
+        self.assertNotIn("awaiting_human_decision_reason", state)
+        # After resume, Stop hook must once again auto-continue.
+        hook = self._invoke_stop_hook(repo, state_home)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertIn('"decision": "block"', hook.stdout)
+
+    def test_next_action_surfaces_awaiting_human_decision(self) -> None:
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        self._run_controller(
+            repo,
+            "await-decision",
+            "--reason",
+            "which style guide?",
+            state_home=state_home,
+        )
+        na = self._run_controller(repo, "next-action", state_home=state_home)
+        self.assertEqual(na.returncode, 0, na.stderr)
+        payload = json.loads(na.stdout)
+        self.assertEqual(payload["phase"], "awaiting-human-decision")
+        self.assertIn("resume", payload["required_action"])
+        self.assertIn("which style guide?", payload["required_action"])
+
+    def test_await_decision_rejects_terminal_run(self) -> None:
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        self._run_controller(
+            repo, "cancel", "--reason", "test", state_home=state_home
+        )
+        result = self._run_controller(
+            repo,
+            "await-decision",
+            "--reason",
+            "user must confirm rollout direction before we continue",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        # Terminal runs are filtered out at active-mutation resolution, so the
+        # error will report either "no active workflow run" or "terminal".
+        combined = result.stderr.lower()
+        self.assertTrue(
+            "terminal" in combined or "no active" in combined,
+            f"unexpected error: {result.stderr!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Reason-contract sanity checks
+    # ------------------------------------------------------------------
+
+    def test_await_decision_accepts_realistic_concrete_reason(self) -> None:
+        """A concrete, human-decision reason of at least the minimum length
+        that does not match any denylisted whole phrase must be accepted."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        reason = "user must pick between library A and library B"
+        # Sanity — the reason we send is at least the minimum length so the
+        # controller cannot reject it on length grounds.
+        self.assertGreaterEqual(len(reason), 12)
+        result = self._run_controller(
+            repo, "await-decision", "--reason", reason, state_home=state_home
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertTrue(state["awaiting_human_decision"])
+        self.assertEqual(state["awaiting_human_decision_reason"], reason)
+
+    def test_await_decision_rejects_short_reason(self) -> None:
+        """A trivially short reason (< 12 chars after strip) must be rejected
+        with a clear, actionable error that quotes the offending reason and
+        the minimum length."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        result = self._run_controller(
+            repo, "await-decision", "--reason", "no ", state_home=state_home
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("12 characters", result.stderr)
+        # The offending reason must be echoed back so the caller can see
+        # what was rejected (stripped, quoted).
+        self.assertIn("'no'", result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertFalse(state["awaiting_human_decision"])
+
+    def test_await_decision_rejects_denylisted_generic_reasons(self) -> None:
+        """Whole-phrase denylisted reasons (case-insensitive) must be
+        rejected, even if some of them happen to be at least 12 chars."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        # Cover a mix: some are >= 12 chars (would pass length) so the
+        # denylist is the only thing catching them; some are < 12 chars but
+        # would still be denylist-rejected first for a clearer error;
+        # varying case to prove case-insensitivity; leading/trailing
+        # whitespace to prove strip semantics.
+        cases = [
+            "stopping",
+            "STOP",
+            "  Unclear  ",
+            "need input",
+            "too hard",
+            "too big",
+            "too long",
+            "low priority",
+            "pausing",
+            "taking a break",
+            "Human Decision Needed",
+        ]
+        for reason in cases:
+            with self.subTest(reason=reason):
+                result = self._run_controller(
+                    repo,
+                    "await-decision",
+                    "--reason",
+                    reason,
+                    state_home=state_home,
+                )
+                self.assertNotEqual(
+                    result.returncode, 0, f"unexpectedly accepted {reason!r}"
+                )
+                # The error must be one of the two contract-hint messages —
+                # either denylist ("generic placeholder") or length. In
+                # every case we expect the actionable contract hint about
+                # what await-decision may and may not be used for.
+                self.assertIn(
+                    "await-decision", result.stderr, result.stderr
+                )
+                self.assertTrue(
+                    "generic placeholder" in result.stderr
+                    or "12 characters" in result.stderr,
+                    f"error did not name the disallowed pattern: {result.stderr!r}",
+                )
+                # And state must not have been mutated.
+                state = json.loads(
+                    self._find_state_path(repo, state_home).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertFalse(state["awaiting_human_decision"])
+
+    def test_await_decision_denylist_is_whole_phrase_not_substring(self) -> None:
+        """A legitimate longer sentence that *contains* a denylisted word as
+        a substring must be accepted — the denylist is exact whole-phrase
+        (case-insensitive), NOT substring matching. This is critical so
+        genuine decisions like 'user must choose license for the new
+        package — this is unclear from the code' are not blocked."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        # This reason contains "unclear" as a substring but is not the
+        # whole reason, so it must be accepted.
+        reason = (
+            "user must choose license for the new package — this is "
+            "unclear from the code"
+        )
+        result = self._run_controller(
+            repo, "await-decision", "--reason", reason, state_home=state_home
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertTrue(state["awaiting_human_decision"])
+        self.assertEqual(state["awaiting_human_decision_reason"], reason)
+
+    def test_await_decision_denylist_substring_second_example(self) -> None:
+        """Second whole-phrase-vs-substring check: a legitimate sentence
+        containing several denylist words as substrings must still be
+        accepted."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        # "stop" and "too long" both appear as substrings inside this
+        # sentence but neither is the whole reason.
+        reason = (
+            "user must decide whether to stop the migration because the "
+            "downtime window is too long for the current release"
+        )
+        result = self._run_controller(
+            repo, "await-decision", "--reason", reason, state_home=state_home
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(
+            self._find_state_path(repo, state_home).read_text(encoding="utf-8")
+        )
+        self.assertTrue(state["awaiting_human_decision"])
+
+    def test_await_decision_error_message_quotes_disallowed_phrase(self) -> None:
+        """When rejecting a denylisted phrase, the error must quote the
+        offending phrase and remind the caller of the contract."""
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(
+            repo, "init", "--feature", "F", state_home=state_home
+        )
+        result = self._run_controller(
+            repo,
+            "await-decision",
+            "--reason",
+            "low priority",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        # The offending reason is quoted.
+        self.assertIn("'low priority'", result.stderr)
+        # And the contract hint reminds why it was rejected.
+        self.assertIn("generic placeholder", result.stderr)
+        self.assertIn("specific human choice", result.stderr)
+
+
+class SkillContractTests(unittest.TestCase):
+    """The SKILL.md files must state the controller-first contract explicitly
+    so Claude cannot reason that a small task is exempt from the workflow."""
+
+    def _skill_text(self, name: str) -> str:
+        return (
+            ROOT / "skills" / name / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+    def _normalized(self, text: str) -> str:
+        """Collapse whitespace so hard-wrapped markdown prose matches
+        single-line substring assertions."""
+        import re
+
+        return re.sub(r"\s+", " ", text)
+
+    def _assert_controller_first_contract(self, name: str) -> None:
+        text = self._skill_text(name)
+        normalized = self._normalized(text)
+        # The controller-first rule must appear in the non-negotiable list.
+        self.assertIn("controller state machine", normalized)
+        self.assertIn("ONLY permitted execution path", normalized)
+        # And the wording must explicitly reject task-size reasoning.
+        self.assertIn("documentation-only", normalized)
+        self.assertIn(
+            "Task complexity does NOT select the workflow mode", normalized
+        )
+        # And it must document the human-decision affordance.
+        self.assertIn("await-decision", normalized)
+
+    def _assert_await_decision_contract(self, name: str) -> None:
+        """The SKILL.md must include an explicit `When await-decision may /
+        may not be used` section listing the only legitimate uses, the
+        forbidden uses, and the requirement that the reason state the
+        concrete decision."""
+        text = self._skill_text(name)
+        normalized = self._normalized(text)
+        # Section header.
+        self.assertIn(
+            "When `await-decision` may / may not be used", normalized
+        )
+        # Legitimate uses — the three categories from the contract.
+        self.assertIn("specific human choice", normalized)
+        self.assertIn("authorization", normalized)
+        self.assertIn("missing fact", normalized)
+        self.assertIn("cannot be safely inferred", normalized)
+        # Forbidden uses — each of the five forbidden reasons.
+        self.assertIn("the task is difficult", normalized)
+        self.assertIn(
+            "the task is ambiguous but the correct choice can be safely "
+            "inferred",
+            normalized,
+        )
+        self.assertIn("the task is lengthy", normalized)
+        self.assertIn("the task feels low priority", normalized)
+        self.assertIn("the model would prefer to stop", normalized)
+        # The reason must state the CONCRETE decision required.
+        self.assertIn("CONCRETE decision required", normalized)
+        # Mechanical enforcement must be documented — minimum length and
+        # denylist. Callers must be able to read the SKILL and know
+        # exactly what the controller will reject.
+        self.assertIn("12 characters", normalized)
+        # A few representative denylist entries — enough to show the reader
+        # what kind of phrases are banned without pinning every entry.
+        for phrase in (
+            "`stop`",
+            "`unclear`",
+            "`need input`",
+            "`low priority`",
+            "`human decision needed`",
+        ):
+            self.assertIn(phrase, normalized)
+        # Whole-phrase-not-substring guarantee is spelled out so Claude
+        # understands the rule (a longer sentence containing one of these
+        # words is fine).
+        self.assertIn("only the whole reason is compared", normalized)
+
+    def test_autonomous_current_forbids_bypass_by_task_size(self) -> None:
+        self._assert_controller_first_contract("autonomous-current")
+
+    def test_autonomous_main_forbids_bypass_by_task_size(self) -> None:
+        self._assert_controller_first_contract("autonomous-main")
+
+    def test_autonomous_feature_forbids_bypass_by_task_size(self) -> None:
+        self._assert_controller_first_contract("autonomous-feature")
+
+    def test_autonomous_current_documents_await_decision_contract(self) -> None:
+        self._assert_await_decision_contract("autonomous-current")
+
+    def test_autonomous_main_documents_await_decision_contract(self) -> None:
+        self._assert_await_decision_contract("autonomous-main")
+
+    def test_autonomous_feature_documents_await_decision_contract(self) -> None:
+        self._assert_await_decision_contract("autonomous-feature")
+
+
 if __name__ == "__main__":
     unittest.main()

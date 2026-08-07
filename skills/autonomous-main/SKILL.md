@@ -42,6 +42,52 @@ the current `main`/`master` checkout.
 
 ## Non-negotiable boundaries
 
+- **The controller state machine is the ONLY permitted execution path for this skill.** When
+  invoked, always run `controller.py init` (or `--reuse` an existing active run) and then follow
+  `controller.py next-action` until it reports `phase: evaluate`, at which point run
+  `controller.py evaluate`. Never bypass the controller because a task looks small, "obvious",
+  documentation-only, well-scoped, or otherwise low-risk. Task complexity does NOT select the
+  workflow mode — the configured/snapshotted mode does. A lean preset (or `--mode lean`) is the
+  way to request lighter phases; there is no "skip controller" affordance.
+- **Terminate only on a controller-authorized state.** Stop when the controller reports the run
+  as `complete`, `blocked`, `cancelled`, or when you have explicitly marked it awaiting a genuine
+  human decision (see below). Do not otherwise decide the workflow is finished.
+- **Genuine human decisions must be recorded before stopping.** If you actually need the user to
+  resolve an ambiguity or authorize a step that only they can decide, first mark the run as
+  awaiting that decision:
+
+  ```bash
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" await-decision \
+    --reason "specific question the user must answer"
+  ```
+
+  The Stop hook respects this state and will not force the next controller action. When the user
+  answers, the workflow calls `controller.py resume` and continues from `next-action`.
+
+  **When `await-decision` may / may not be used.** `await-decision` is NOT a general stopping
+  mechanism. It may be used ONLY when continued execution genuinely requires one of:
+
+  - a specific human choice (e.g. "user must pick between library A and library B for the new
+    dependency");
+  - an authorization only the user can grant (e.g. "user must authorize dropping the legacy
+    `sessions` table");
+  - a missing fact that cannot be safely inferred from the codebase, spec, or standard practice
+    (e.g. "the OIDC issuer URL is not in any config file and must be provided by the user").
+
+  `await-decision` must NOT be used because:
+
+  - the task is difficult;
+  - the task is ambiguous but the correct choice can be safely inferred;
+  - the task is lengthy or has many steps;
+  - the task feels low priority;
+  - the model would prefer to stop or take a break.
+
+  The `--reason` string must state the CONCRETE decision required — not a general "need input"
+  or "unclear next step". The controller rejects reasons shorter than 12 characters after strip
+  and rejects a small denylist of exact generic placeholders (case-insensitive, whole-phrase):
+  `stop`, `stopping`, `pausing`, `taking a break`, `need input`, `unclear`,
+  `human decision needed`, `too hard`, `too big`, `too long`, `low priority`. A fuller sentence
+  that merely contains one of these words is fine — only the whole reason is compared.
 - This skill must NOT call `EnterWorktree` / `ExitWorktree`. All edits land in the current
   checkout. Do not create or enter `.claude/worktrees/*`.
 - Require a clean working tree. `git status --porcelain` must be empty before initializing. If
@@ -57,7 +103,11 @@ the current `main`/`master` checkout.
 - Use no more than the configured review-round budget.
 - Treat every Codex finding as a proposal requiring evidence-based triage.
 
-## Driver loop
+## Required driver loop
+
+Every invocation of this skill runs the controller loop below. There is no fast path, no
+"documentation-only" shortcut, no "this task is too small" bypass. The controller and its
+configured mode decide which phases apply.
 
 1. Confirm this is a Git repository. Inspect `CLAUDE.md`, repository instructions, architecture,
    status, and tests. Verify the working tree is clean before initializing.
