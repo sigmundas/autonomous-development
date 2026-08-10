@@ -14,16 +14,45 @@ version = 1
 [ui_review]
 command = ["./.venv/bin/python", "-m", "tools.render_review_screenshots"]
 timeout_seconds = 120
+scenario_flag = "--scenario"
+group_flag = "--group"
 ```
 
 `command` is an argv array and is never interpreted by a shell. The controller
-appends one argument: a new, run-owned output directory. No credentials,
-network access, database access, or desktop-capture permission is added by the
-framework. A missing configuration leaves existing non-visual workflows unchanged.
+appends one argument: a new, run-owned output directory. Repositories that support
+task-specific selection may declare `scenario_flag` and `group_flag`; these define
+the optional repeated `--scenario <id>` / `--group <name>` renderer extension.
+Selectors are inserted after `command` and before the output directory. Repositories
+that omit both flags retain the original command-plus-output-directory behavior. No
+credentials, network access, database access, or desktop-capture permission is added
+by the framework. A missing configuration leaves existing non-visual workflows unchanged.
 
 Repositories should also describe the direct renderer command in `AGENTS.md`.
 That lets ordinary agents generate the same evidence on request without running
 the autonomous workflow.
+
+## Ownership and task-specific selection
+
+Scenario definition is repository-owned; scenario relevance is task-owned; evidence
+orchestration is framework-owned.
+
+Implementation and fix agents can record optional structured metadata:
+
+```json
+{
+  "ui_review": {
+    "groups": ["reference-library"],
+    "scenarios": ["reference.dark"]
+  }
+}
+```
+
+The framework persists the latest selection in run state. The implementation
+selection feeds the first independent review. A fix result that omits `ui_review`
+preserves it; a new selection replaces it; an explicitly empty `ui_review` clears
+it. Every review invokes the renderer afresh in that round's staging directory.
+Invalid IDs fail visibly through the repository renderer. The framework never
+silently retries without selectors or falls back to rendering every screen.
 
 ## Manifest version 1
 
@@ -71,9 +100,9 @@ whether images were attached to Codex. Invocation-unique staging plus the
 existing locked round merge prevents a concurrent or retried review from
 receiving a previous round's screenshots as current evidence.
 
-Renderer configuration errors, unavailable commands, timeouts, non-zero exits,
-missing or malformed manifests, unsafe paths, missing files, unsupported formats,
-and limit violations degrade visual evidence instead of failing the code review.
+Renderer configuration errors, unavailable commands, timeouts, rejected selectors,
+non-zero exits, missing or malformed manifests, unsafe paths, missing files,
+unsupported formats, and limit violations degrade visual evidence instead of failing the code review.
 The review prompt names the reason and explicitly says that visual evidence was
 unavailable. A successful review preserves the failed renderer's logs as the
 round artifact.
@@ -98,4 +127,6 @@ non-interactive prompt path (`--file` refers to hosted file resources). Phase 1
 therefore does not inject screenshots into Claude implementation/fix subagents.
 The paths remain available as run artifacts, and repository `AGENTS.md` guidance
 can tell interactive agents with an image-viewing tool how to generate and inspect
-them directly.
+them directly. Reviewer prompts identify selected screenshots as fresh and relevant
+to the current implementation, but not exhaustive, while retaining the normal
+code, correctness, and test review.

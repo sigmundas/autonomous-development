@@ -49,6 +49,7 @@ from state import (
     assert_transition_allowed,
     detect_drift,
     repository_context,
+    atomic_write_json,
     LEGACY_STATE_REL,
 )
 from schema_validation import SchemaValidationError, validate_payload
@@ -85,6 +86,23 @@ PHASE_OUTPUTS = {
 # Round-2+ code review uses a compact delta prompt/schema.
 REVIEW_DELTA_PROMPT = "prompts/code-review-delta.md"
 REVIEW_DELTA_SCHEMA = "schemas/review-delta.schema.json"
+WORK_RESULT_SCHEMA = "schemas/work-result.schema.json"
+COMPLETION_DISPOSITION_SCHEMA = "schemas/completion-disposition.schema.json"
+
+DISPOSITION_MUST_FIX = "MUST_FIX_NOW"
+DISPOSITION_FIX_LATER = "FIX_LATER"
+DISPOSITION_ACCEPTED = "ACCEPTED_WITH_EVIDENCE"
+DISPOSITION_HUMAN = "HUMAN_DECISION_REQUIRED"
+HARD_BLOCKING_IMPACTS = {
+    "acceptance_criterion",
+    "ordinary_use_correctness",
+    "realistic_data_loss",
+    "security_privacy_authz",
+    "destructive_irreversible",
+    "required_compatibility",
+    "required_verification",
+    "feature_not_satisfied",
+}
 
 # Phase-specific Codex reasoning profiles. Installations may override these via the
 # CLAUDE_AUTONOMOUS_PHASE_PROFILES env var (a JSON object keyed by phase) and select a
@@ -1857,25 +1875,25 @@ def cmd_codex(args: argparse.Namespace) -> int:
                         "Review budget changed concurrently (now round "
                         f"{fresh_round} of {fresh_max}); retry the review."
                     )
-                fresh["phase"] = "review-budget-exhausted"
-                fresh["awaiting_human_decision"] = True
-                fresh["awaiting_human_decision_reason"] = (
-                    "Review budget exhausted; a human must authorize one additional "
-                    "confirmation review or choose a follow-up continuation."
-                )
+                fresh["phase"] = "completion-evaluation"
+                fresh["awaiting_human_decision"] = False
+                fresh.pop("awaiting_human_decision_reason", None)
                 changed = mark_review_evidence_stale_if_changed(repo, fresh)
                 fresh["recovery"] = {
                     "kind": "review-budget-exhausted",
                     "work_preserved": True,
                     "verification_preserved": True,
-                    "recommended_action": "allow-one-more-review",
+                    "recommended_action": "disposition",
                     "changed_since_review": changed,
                 }
                 fresh.setdefault("notes", []).append(
                     f"Maximum review rounds exhausted ({fresh_max})"
                 )
                 save_run_state(run_dir, fresh)
-            raise WorkflowError(f"Maximum review rounds exhausted ({fresh_max})")
+            raise WorkflowError(
+                f"Maximum review rounds exhausted ({fresh_max}); run completion "
+                "disposition, or explicitly authorize one additional review."
+            )
         # Round 1 is a full review; rounds 2+ use the compact delta schema/prompt.
         # A delta review only carries forward findings relative to a recorded
         # full-review baseline (which seeds cumulative_findings). If no full
@@ -1916,6 +1934,14 @@ def cmd_codex(args: argparse.Namespace) -> int:
             repo.canonical_root,
             run_dir / f".staging-{stage_id}.{evidence_phase_label}.ui-evidence",
             run_process,
+            selection={
+                "scenarios": list(
+                    (state.get("ui_review_selection") or {}).get("scenarios") or []
+                ),
+                "groups": list(
+                    (state.get("ui_review_selection") or {}).get("groups") or []
+                ),
+            },
         )
         if evidence_result.available:
             images_attached = codex_supports_images(run_process, repo.canonical_root)
@@ -2189,6 +2215,8 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 }
                 if evidence_result.detail:
                     evidence_record["detail"] = evidence_result.detail
+                if evidence_result.selection_applied:
+                    evidence_record["selection"] = evidence_result.selection
                 if evidence_result.output_dir is not None:
                     evidence_canonical = run_dir / phase_label / "screenshots"
                     evidence_canonical.parent.mkdir(parents=True, exist_ok=True)
@@ -2866,6 +2894,80 @@ def cmd_set_phase(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# cmd_record_work_result
+# ---------------------------------------------------------------------------
+
+
+def cmd_record_work_result(args: argparse.Namespace) -> int:
+    """Persist validated implementation/fix metadata and its current UI selection."""
+    repo, state_home, run_id_override = get_context(args)
+    run_ref = resolve_run_for_active_mutation(
+        state_home,
+        repo.id,
+        repo.canonical_root,
+        run_id_override,
+        operation="record-work-result",
+    )
+    run_dir = run_ref.run_dir
+    source = _resolve_source_path(args.file, run_dir, label="Work result")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"Cannot read work result: {exc}") from exc
+    try:
+        validate_payload(payload, WORK_RESULT_SCHEMA, label="Work result")
+    except SchemaValidationError as exc:
+        raise WorkflowError(str(exc)) from exc
+
+    with RunStateLock(run_dir):
+        state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
+        require_active_run_state(state, run_ref.run_id, "record-work-result")
+        require_no_unsafe_drift(state, repo)
+
+        index = len(state.get("work_results", [])) + 1
+        canonical = run_dir / f"work-result-{index:02d}-{args.kind}.json"
+        canonical.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        relative = make_relative_path(canonical, run_dir)
+        record: dict[str, Any] = {
+            "kind": args.kind,
+            "path": relative,
+            "recorded_at": utc_now(),
+            "after_review_round": int(state.get("review_round", 0)),
+        }
+
+        # Absence preserves the current selection. An explicit empty object or
+        # empty arrays clears it, which is the only extra clearing mechanism.
+        if "ui_review" in payload:
+            requested = payload.get("ui_review") or {}
+            selection = {
+                "scenarios": list(requested.get("scenarios") or []),
+                "groups": list(requested.get("groups") or []),
+            }
+            state["ui_review_selection"] = {
+                **selection,
+                "source": args.kind,
+                "work_result": relative,
+                "updated_at": utc_now(),
+                "after_review_round": int(state.get("review_round", 0)),
+            }
+            record["ui_review"] = selection
+        state.setdefault("work_results", []).append(record)
+        state.setdefault("artifacts", {})["latest_work_result"] = relative
+        state["stop_gate_blocks"] = 0
+        try:
+            save_run_state(run_dir, state)
+        except Exception:
+            canonical.unlink(missing_ok=True)
+            raise
+    print(canonical)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # cmd_await_decision / cmd_resume
 # ---------------------------------------------------------------------------
 
@@ -3046,10 +3148,15 @@ def cmd_authorize_review(args: argparse.Namespace) -> int:
                 "reused": True,
             }))
             return 0
-        if state.get("phase") != "review-budget-exhausted" and not is_review_recovery_child:
+        recovery = state.get("recovery", {})
+        exhausted_here = (
+            isinstance(recovery, dict)
+            and recovery.get("kind") == "review-budget-exhausted"
+        )
+        if not exhausted_here and not is_review_recovery_child:
             raise WorkflowError(
                 "authorize-review is only allowed while the current run is in "
-                "review-budget-exhausted or is a linked continuation carrying "
+                "review-budget-exhausted completion evaluation or is a linked continuation carrying "
                 "the allow-one-more-review recovery intent."
             )
         grant = {
@@ -3321,6 +3428,9 @@ def cmd_continue_run(args: argparse.Namespace) -> int:
                 "cumulative_findings": json.loads(json.dumps(parent_state.get("cumulative_findings", []))),
                 "cumulative_acceptance_criteria": json.loads(json.dumps(parent_state.get("cumulative_acceptance_criteria", []))),
                 "review_ledger": json.loads(json.dumps(parent_state.get("review_ledger", []))),
+                "ui_review_selection": json.loads(
+                    json.dumps(parent_state.get("ui_review_selection", {}))
+                ),
                 "codex_runs": [],
                 "risk": json.loads(json.dumps(parent_state.get("risk", {}))),
                 "review_evidence": {"state": "current", "source_run_id": parent.run_id},
@@ -3430,6 +3540,33 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         elif any(check.get("exit_code") != 0 for check in checks):
             reasons.append("One or more verification checks failed")
 
+        concerns = remaining_completion_concerns(state, run_dir)
+        disposition_blockers, missing_dispositions = _completion_disposition_blockers(
+            state, run_dir
+        )
+        disposition_clears_concerns = bool(concerns) and not (
+            disposition_blockers or missing_dispositions
+        )
+        if missing_dispositions:
+            reasons.append(
+                f"{len(missing_dispositions)} remaining finding(s) lack an explicit "
+                "completion disposition"
+            )
+        must_fix = [
+            item
+            for item in disposition_blockers
+            if item.get("disposition") == DISPOSITION_MUST_FIX
+        ]
+        human = [
+            item
+            for item in disposition_blockers
+            if item.get("disposition") == DISPOSITION_HUMAN
+        ]
+        if must_fix:
+            reasons.append(f"{len(must_fix)} MUST_FIX_NOW finding(s) remain")
+        if human:
+            reasons.append(f"{len(human)} HUMAN_DECISION_REQUIRED finding(s) remain")
+
         reviews = state.get("reviews", [])
         if not reviews:
             reasons.append("No Codex code review recorded")
@@ -3443,7 +3580,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 reasons.append(f"Could not read latest review: {exc}")
                 review = {}
             verdict = review.get("verdict")
-            if verdict != "pass":
+            if verdict != "pass" and not disposition_clears_concerns:
                 reasons.append(
                     f"Latest Codex review verdict is {verdict}"
                 )
@@ -3456,7 +3593,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 severe = cumulative_unresolved_severe(state)
             else:
                 severe = unresolved_severe_findings(review)
-            if severe:
+            if severe and not disposition_clears_concerns:
                 reasons.append(
                     f"{len(severe)} unresolved critical/high finding(s) in "
                     f"review ledger: {_describe_blocking_findings(severe)}"
@@ -3474,7 +3611,9 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             # coexist with unresolved blocking findings or unsatisfied acceptance
             # criteria. Surfacing the inconsistency explicitly stops a contradictory
             # review from being read as evidence of completion.
-            if verdict == "pass" and (severe or blocking_ac):
+            if verdict == "pass" and (
+                (severe and not disposition_clears_concerns) or blocking_ac
+            ):
                 reasons.append(
                     "Latest review verdict is 'pass' but "
                     f"{len(severe)} blocking finding(s) and {len(blocking_ac)} "
@@ -3488,7 +3627,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             adversarial = state.get("adversarial_reviews", [])
             if not adversarial:
                 reasons.append("High-risk change requires an adversarial review")
-            elif adversarial[-1].get("verdict") != "pass":
+            elif (
+                adversarial[-1].get("verdict") != "pass"
+                and not disposition_clears_concerns
+            ):
                 reasons.append(
                     f"Latest adversarial review verdict is "
                     f"{adversarial[-1].get('verdict')}"
@@ -3499,8 +3641,15 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             state["phase"] = "completion-gates-failed"
             state["completion_gate_failures"] = reasons
         else:
-            state["status"] = "complete"
-            state["phase"] = "complete"
+            followups = [
+                item
+                for item in _disposition_index(state).values()
+                if item.get("disposition") == DISPOSITION_FIX_LATER
+            ]
+            state["status"] = (
+                "complete_with_followups" if followups else "complete"
+            )
+            state["phase"] = state["status"]
             state["completion_gate_failures"] = []
         save_run_state(run_dir, state)
 
@@ -3508,7 +3657,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         for reason in reasons:
             print(f"- {reason}", file=sys.stderr)
         return 1
-    print("Workflow complete")
+    if state.get("status") == "complete_with_followups":
+        print(f"Workflow complete with {len(followups)} follow-up(s)")
+    else:
+        print("Workflow complete")
     return 0
 
 
@@ -4046,6 +4198,460 @@ def cmd_triage(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Completion disposition / durable follow-ups
+# ---------------------------------------------------------------------------
+
+
+def _read_json_artifact(run_dir: Path, relative: object) -> dict[str, Any]:
+    if not isinstance(relative, str) or not relative:
+        return {}
+    try:
+        path = resolve_artifact_path(relative, run_dir)
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (StateError, OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def remaining_completion_concerns(
+    state: dict[str, Any], run_dir: Path
+) -> dict[tuple[str, int, str], dict[str, Any]]:
+    """Return the current regular/adversarial concerns requiring disposition."""
+    concerns: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for finding in state.get("cumulative_findings", []):
+        if not isinstance(finding, dict):
+            continue
+        released = (
+            finding.get("status") in NON_BLOCKING_TRIAGE_STATUSES
+            and finding.get("assessment_state") != "needs_reassessment"
+        )
+        if released:
+            continue
+        source_id = str(finding.get("id") or "").strip()
+        if not source_id:
+            continue
+        source_round = int(
+            finding.get("round_last_seen") or finding.get("round") or 1
+        )
+        concerns[("review", source_round, source_id)] = finding
+
+    adversarial = state.get("adversarial_reviews", [])
+    if adversarial and isinstance(adversarial[-1], dict):
+        ref = adversarial[-1]
+        if ref.get("verdict") != "pass":
+            source_round = int(ref.get("round") or len(adversarial))
+            artifact = _read_json_artifact(run_dir, ref.get("path"))
+            for index, threat in enumerate(artifact.get("threats", []), start=1):
+                if not isinstance(threat, dict):
+                    continue
+                source_id = str(threat.get("id") or f"A-{source_round}-T-{index}")
+                concerns[("adversarial", source_round, source_id)] = threat
+    return concerns
+
+
+def _disposition_index(state: dict[str, Any]) -> dict[tuple[str, int, str], dict[str, Any]]:
+    evaluation = state.get("completion_evaluation", {})
+    if not isinstance(evaluation, dict):
+        return {}
+    if evaluation.get("source_review_round") != state.get("review_round", 0):
+        return {}
+    if evaluation.get("source_adversarial_round") != len(
+        state.get("adversarial_reviews", [])
+    ):
+        return {}
+    result: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for item in evaluation.get("findings", []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            key = (
+                str(item["source_phase"]),
+                int(item["source_round"]),
+                str(item["source_id"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        result[key] = item
+    return result
+
+
+def _completion_disposition_blockers(
+    state: dict[str, Any], run_dir: Path
+) -> tuple[list[dict[str, Any]], list[tuple[str, int, str]]]:
+    concerns = remaining_completion_concerns(state, run_dir)
+    dispositions = _disposition_index(state)
+    missing = [key for key in concerns if key not in dispositions]
+    blockers = [
+        dispositions[key]
+        for key in concerns
+        if key in dispositions
+        and dispositions[key].get("disposition")
+        in {DISPOSITION_MUST_FIX, DISPOSITION_HUMAN}
+    ]
+    return blockers, missing
+
+
+def _write_followup_artifacts(
+    run_dir: Path, run_id: str, findings: list[dict[str, Any]]
+) -> tuple[str, str]:
+    followups: list[dict[str, Any]] = []
+    for index, item in enumerate(findings, start=1):
+        if item.get("disposition") != DISPOSITION_FIX_LATER:
+            continue
+        followups.append(
+            {
+                "id": f"FU-{index:03d}",
+                "title": item["title"],
+                "source_run_id": run_id,
+                "source_phase": item["source_phase"],
+                "source_round": item["source_round"],
+                "original_finding_id": item["source_id"],
+                "severity": item["severity"],
+                "category": item["category"],
+                "description": item["description"],
+                "why_deferred": item["rationale"],
+                "relevant_acceptance_criteria": item["relevant_acceptance_criteria"],
+                "relevant_files": item["relevant_files"],
+                "suggested_future_scope": item["suggested_future_scope"],
+                "recommended_verification": item["recommended_verification"],
+                "human_input_eventually_required": item[
+                    "human_input_eventually_required"
+                ],
+                "provenance": item["provenance"],
+            }
+        )
+    payload = {"source_run_id": run_id, "follow_ups": followups}
+    json_name = "follow-ups.json"
+    md_name = "follow-ups.md"
+    atomic_write_json(run_dir / json_name, payload)
+    lines = [f"# Follow-ups for {run_id}", ""]
+    for item in followups:
+        lines.extend(
+            [
+                f"## {item['id']}: {item['title']}",
+                "",
+                str(item["description"]),
+                "",
+                f"Deferred because: {item['why_deferred']}",
+                "",
+                f"Provenance: {item['provenance']}",
+                "",
+            ]
+        )
+    temp = run_dir / f".{md_name}.{uuid.uuid4().hex}.tmp"
+    temp.write_text("\n".join(lines), encoding="utf-8")
+    temp.replace(run_dir / md_name)
+    return json_name, md_name
+
+
+def cmd_disposition(args: argparse.Namespace) -> int:
+    repo, state_home, run_id_override = get_context(args)
+    run_ref = resolve_run_for_active_mutation(
+        state_home,
+        repo.id,
+        repo.canonical_root,
+        run_id_override,
+        operation="disposition",
+    )
+    source = _resolve_source_path(args.file, run_ref.run_dir, label="Completion disposition")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        validate_payload(
+            payload, COMPLETION_DISPOSITION_SCHEMA, label="Completion disposition"
+        )
+    except (OSError, json.JSONDecodeError, SchemaValidationError) as exc:
+        raise WorkflowError(f"Cannot accept completion disposition: {exc}") from exc
+
+    findings = payload["findings"]
+    keys = [
+        (item["source_phase"], item["source_round"], item["source_id"])
+        for item in findings
+    ]
+    if len(keys) != len(set(keys)):
+        raise WorkflowError("Completion disposition contains duplicate source findings")
+    for item in findings:
+        disposition = item["disposition"]
+        impact = item["impact"]
+        if impact in HARD_BLOCKING_IMPACTS and disposition != DISPOSITION_MUST_FIX:
+            raise WorkflowError(
+                f"{item['source_id']} has hard-blocking impact {impact!r} and must be "
+                f"{DISPOSITION_MUST_FIX}; it cannot be deferred or accepted."
+            )
+        if impact == "product_scientific_decision" and disposition != DISPOSITION_HUMAN:
+            raise WorkflowError(
+                f"{item['source_id']} requires a product/scientific decision and must be "
+                f"{DISPOSITION_HUMAN}."
+            )
+        if disposition == DISPOSITION_FIX_LATER and impact not in {
+            "additional_hardening",
+            "out_of_scope",
+        }:
+            raise WorkflowError(
+                f"{item['source_id']} may be FIX_LATER only when it is additional "
+                "hardening or outside accepted scope."
+            )
+        if disposition == DISPOSITION_ACCEPTED and impact != "incorrect_or_mitigated":
+            raise WorkflowError(
+                f"{item['source_id']} may be ACCEPTED_WITH_EVIDENCE only when it is "
+                "incorrect, mitigated, not applicable, specified, or already evidenced."
+            )
+        if disposition == DISPOSITION_ACCEPTED and not str(item.get("evidence", "")).strip():
+            raise WorkflowError(
+                f"{item['source_id']} ACCEPTED_WITH_EVIDENCE requires non-empty evidence."
+            )
+
+    with RunStateLock(run_ref.run_dir):
+        state = load_run_state(run_ref.run_dir)
+        verify_loaded_run_identity(state, run_dir=run_ref.run_dir, expected_repo_id=repo.id)
+        require_active_run_state(state, run_ref.run_id, "disposition")
+        require_no_unsafe_drift(state, repo)
+        concerns = remaining_completion_concerns(state, run_ref.run_dir)
+        supplied = set(keys)
+        expected = set(concerns)
+        if supplied != expected:
+            missing = sorted(expected - supplied)
+            extra = sorted(supplied - expected)
+            raise WorkflowError(
+                "Completion disposition must cover every current remaining finding "
+                f"exactly once (missing={missing}, extra={extra})."
+            )
+        blocking_ac = blocking_acceptance_criteria(state)
+        if blocking_ac:
+            raise WorkflowError(
+                "Cannot disposition around unsatisfied required acceptance criteria: "
+                f"{_describe_blocking_acceptance_criteria(blocking_ac)}"
+            )
+        json_name, md_name = _write_followup_artifacts(
+            run_ref.run_dir, run_ref.run_id, findings
+        )
+        result = (
+            "human_decision_required"
+            if any(i["disposition"] == DISPOSITION_HUMAN for i in findings)
+            else "must_fix_now"
+            if any(i["disposition"] == DISPOSITION_MUST_FIX for i in findings)
+            else "ready_with_followups"
+            if any(i["disposition"] == DISPOSITION_FIX_LATER for i in findings)
+            else "ready"
+        )
+        state["completion_evaluation"] = {
+            "evaluated_at": utc_now(),
+            "summary": payload["summary"],
+            "result": result,
+            "findings": findings,
+            "source_review_round": state.get("review_round", 0),
+            "source_adversarial_round": len(state.get("adversarial_reviews", [])),
+        }
+        state.setdefault("artifacts", {}).update(
+            {"follow_ups_json": json_name, "follow_ups_markdown": md_name}
+        )
+        state["phase"] = "completion-evaluation"
+        human = [i for i in findings if i["disposition"] == DISPOSITION_HUMAN]
+        state["awaiting_human_decision"] = bool(human)
+        if human:
+            state["awaiting_human_decision_reason"] = "; ".join(
+                f"{i['title']}: {i['rationale']}" for i in human
+            )
+            state["awaiting_human_decision_phase"] = human[0]["source_phase"]
+        else:
+            state.pop("awaiting_human_decision_reason", None)
+            state.pop("awaiting_human_decision_phase", None)
+        state["stop_gate_blocks"] = 0
+        save_run_state(run_ref.run_dir, state)
+    print(json.dumps(state["completion_evaluation"], indent=2))
+    return 0
+
+
+def _bounded_text(value: object, limit: int = 1200) -> str:
+    text = str(value or "").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def cmd_continuation_context(args: argparse.Namespace) -> int:
+    """Emit compact, bounded startup context for a fresh agent session."""
+    repo, state_home, run_id_override = get_context(args)
+    run_ref = resolve_run_for_inspection(
+        state_home, repo.id, repo.canonical_root, run_id_override
+    )
+    state = run_ref.state
+    checks = latest_verification_checks(
+        state.get("verification", {}).get("checks", [])
+    )
+    followups_artifact = _read_json_artifact(
+        run_ref.run_dir,
+        state.get("artifacts", {}).get("follow_ups_json", "follow-ups.json"),
+    )
+    evaluation = state.get("completion_evaluation", {})
+    findings = evaluation.get("findings", []) if isinstance(evaluation, dict) else []
+    must_fix = [
+        {
+            "source_id": item.get("source_id"),
+            "title": _bounded_text(item.get("title"), 200),
+            "rationale": _bounded_text(item.get("rationale"), 400),
+        }
+        for item in findings
+        if isinstance(item, dict) and item.get("disposition") == DISPOSITION_MUST_FIX
+    ][:20]
+    spec_summary = state.get("feature", "")
+    spec_ref = state.get("artifacts", {}).get("accepted_spec")
+    if isinstance(spec_ref, str):
+        try:
+            spec_summary = resolve_artifact_path(spec_ref, run_ref.run_dir).read_text(
+                encoding="utf-8"
+            )
+        except (StateError, OSError):
+            pass
+    regular = state.get("reviews", [])
+    adversarial = state.get("adversarial_reviews", [])
+    regular_latest = regular[-1] if regular and isinstance(regular[-1], dict) else {}
+    adversarial_latest = (
+        adversarial[-1]
+        if adversarial and isinstance(adversarial[-1], dict)
+        else {}
+    )
+    compact_followups = [
+        {
+            "id": item.get("id"),
+            "title": _bounded_text(item.get("title"), 200),
+            "description": _bounded_text(item.get("description"), 500),
+            "why_deferred": _bounded_text(item.get("why_deferred"), 400),
+            "provenance": _bounded_text(item.get("provenance"), 300),
+        }
+        for item in followups_artifact.get("follow_ups", [])[:20]
+        if isinstance(item, dict)
+    ]
+    payload = {
+        "run_id": run_ref.run_id,
+        "parent_run_id": state.get("parent_run_id"),
+        "feature": _bounded_text(state.get("feature"), 500),
+        "accepted_scope_summary": _bounded_text(spec_summary),
+        "phase": state.get("phase"),
+        "status": state.get("status"),
+        "latest_verification": {
+            "total": len(checks),
+            "passed": sum(1 for c in checks if c.get("exit_code") == 0),
+            "failed_names": [
+                _bounded_text(c.get("name"), 120)
+                for c in checks
+                if c.get("exit_code") != 0
+            ][:20],
+        },
+        "regular_review": {
+            "round": regular_latest.get("round"),
+            "verdict": regular_latest.get("verdict"),
+        },
+        "adversarial_review": {
+            "round": adversarial_latest.get("round"),
+            "verdict": adversarial_latest.get("verdict"),
+        },
+        "open_must_fix_now": must_fix,
+        "deferred_follow_ups": compact_followups,
+        "stale_or_unsatisfied_acceptance_criteria": blocking_acceptance_criteria(state)[
+            :20
+        ],
+        "human_decision": state.get("awaiting_human_decision_reason"),
+        "review_budget": {
+            "consumed": state.get("review_round", 0),
+            "snapshotted": state.get("max_review_rounds", 3),
+            "effective": effective_review_limit(state),
+        },
+        "recommended_next_action": compute_next_action(state, run_ref.run_dir),
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_start_followup_run(args: argparse.Namespace) -> int:
+    """Create a semantically new run from selected durable follow-up items."""
+    repo, state_home, run_id_override = get_context(args)
+    source = resolve_run_for_inspection(
+        state_home, repo.id, repo.canonical_root, run_id_override
+    )
+    artifact = _read_json_artifact(
+        source.run_dir,
+        source.state.get("artifacts", {}).get("follow_ups_json", "follow-ups.json"),
+    )
+    available = {
+        item.get("id"): item
+        for item in artifact.get("follow_ups", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    selected_ids = list(dict.fromkeys(args.follow_up_id))
+    missing = [item_id for item_id in selected_ids if item_id not in available]
+    if missing:
+        raise WorkflowError(f"Unknown follow-up id(s): {', '.join(missing)}")
+    selected = [available[item_id] for item_id in selected_ids]
+    with RepoInitLock(state_home, repo.id):
+        active = find_active_runs(state_home, repo.id)
+        if active:
+            raise WorkflowError(
+                "Cannot start a follow-up while another run is active for this repository."
+            )
+        run_id = new_run_id()
+        run_dir = run_dir_path(state_home, repo.id, run_id)
+        run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+        feature = "Follow up: " + "; ".join(str(item["title"]) for item in selected)
+        context = {
+            "source_run_id": source.run_id,
+            "source_feature": _bounded_text(source.state.get("feature"), 500),
+            "selected_follow_ups": selected,
+        }
+        (run_dir / "feature-request.md").write_text(feature + "\n", encoding="utf-8")
+        atomic_write_json(run_dir / "follow-up-context.json", context)
+        state = {
+            "schema_version": 2,
+            "run_id": run_id,
+            "label": args.label or f"Follow-up to {source.run_id}",
+            "feature": feature,
+            "status": "active",
+            "phase": "initialized",
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            "repository": repository_state_block(repo, worktree_mode="isolated"),
+            "baseline": {
+                "commit": repo.head_commit,
+                "branch": repo.branch,
+                "dirty_entries_at_init": git(
+                    repo.canonical_root, "status", "--porcelain", check=False
+                ).splitlines(),
+            },
+            "parent_run_id": source.run_id,
+            "follow_up_source": {
+                "source_run_id": source.run_id,
+                "selected_ids": selected_ids,
+                "context_artifact": "follow-up-context.json",
+            },
+            "requested_mode": source.state.get("requested_mode", "auto"),
+            "effective_mode": source.state.get("effective_mode", "standard"),
+            "mode_reasons": [f"new run from follow-ups in {source.run_id}"],
+            "max_review_rounds": int(source.state.get("max_review_rounds", 3)),
+            "review_round": 0,
+            "stop_gate_blocks": 0,
+            "awaiting_human_decision": False,
+            "artifacts": {
+                "feature_request": "feature-request.md",
+                "follow_up_context": "follow-up-context.json",
+            },
+            "verification": {"checks": [], "passed": False},
+            "reviews": [],
+            "adversarial_reviews": [],
+            "cumulative_findings": [],
+            "cumulative_acceptance_criteria": [],
+            "review_ledger": [],
+            "codex_runs": [],
+            "risk": {
+                "requires_adversarial_review": bool(
+                    source.state.get("risk", {}).get("requires_adversarial_review")
+                ),
+                "reasons": [f"inherited risk posture from {source.run_id}"],
+            },
+            "notes": ["Semantically new run created from selected durable follow-ups"],
+        }
+        save_run_state(run_dir, state)
+    print(json.dumps({"run_id": run_id, "source_run_id": source.run_id, "selected_ids": selected_ids}))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # cmd_next_action
 # ---------------------------------------------------------------------------
 
@@ -4067,7 +4673,7 @@ def compute_next_action(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
         except StateError:
             return (run_dir / fname).exists()
 
-    if status in {"complete", "cancelled", "archived"}:
+    if status in {"complete", "complete_with_followups", "cancelled", "archived"}:
         return {
             "phase": status,
             "required_action": f"Run is {status}; no further action.",
@@ -4189,7 +4795,34 @@ def compute_next_action(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
 
     reviews = state.get("reviews", [])
     latest_pass = bool(reviews) and reviews[-1].get("verdict") == "pass"
-    if not latest_pass or cumulative_unresolved_severe(state):
+    concerns = remaining_completion_concerns(state, run_dir)
+    disposition_blockers, missing_dispositions = _completion_disposition_blockers(
+        state, run_dir
+    )
+    must_fix = [
+        item
+        for item in disposition_blockers
+        if item.get("disposition") == DISPOSITION_MUST_FIX
+    ]
+    if must_fix:
+        return {
+            "phase": "review",
+            "required_action": "Fix the MUST_FIX_NOW findings, verify, and re-review.",
+            "completion_condition": "Latest review verdict is pass with no unresolved "
+            "critical/high findings.",
+            "references": [_reference("review.md")],
+        }
+    if concerns and missing_dispositions:
+        return {
+            "phase": "completion-evaluation",
+            "required_action": "Disposition every remaining review/adversarial finding "
+            "with `controller.py disposition --file ...`.",
+            "completion_condition": "Every remaining finding has an explicit disposition; "
+            "no MUST_FIX_NOW or HUMAN_DECISION_REQUIRED item remains.",
+            "references": [_reference("review.md")],
+            "available_actions": ["disposition", "authorize-review"],
+        }
+    if (not latest_pass or cumulative_unresolved_severe(state)) and not concerns:
         return {
             "phase": "review",
             "required_action": "Run `codex --phase review`, triage findings via "
@@ -4201,7 +4834,7 @@ def compute_next_action(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
 
     if state.get("risk", {}).get("requires_adversarial_review"):
         adversarial = state.get("adversarial_reviews", [])
-        if not adversarial or adversarial[-1].get("verdict") != "pass":
+        if not adversarial:
             return {
                 "phase": "adversarial",
                 "required_action": "Run `codex --phase adversarial` and address any "
@@ -4209,6 +4842,18 @@ def compute_next_action(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
                 "completion_condition": "Latest adversarial review verdict is pass.",
                 "references": [_reference("review.md")],
             }
+        if adversarial[-1].get("verdict") != "pass":
+            if concerns and not missing_dispositions and not disposition_blockers:
+                pass
+            else:
+                return {
+                    "phase": "completion-evaluation",
+                    "required_action": "Disposition every remaining adversarial threat; "
+                    "do not rerun solely because the verdict is changes_required.",
+                    "completion_condition": "Every threat has an explicit disposition and "
+                    "no blocking disposition remains.",
+                    "references": [_reference("review.md")],
+                }
 
     return {
         "phase": "evaluate",
@@ -4529,6 +5174,14 @@ def build_parser() -> argparse.ArgumentParser:
     phase.add_argument("--note")
     phase.set_defaults(func=cmd_set_phase)
 
+    work_result = sub.add_parser(
+        "record-work-result",
+        help="Record validated implementation/fix metadata, including optional UI review selection",
+    )
+    work_result.add_argument("--kind", required=True, choices=("implementation", "fix"))
+    work_result.add_argument("--file", required=True, help="Structured work-result JSON")
+    work_result.set_defaults(func=cmd_record_work_result)
+
     risk = sub.add_parser("set-risk", help="Set whether adversarial review is required")
     risk.add_argument(
         "--require-adversarial", action=argparse.BooleanOptionalAction, default=True
@@ -4594,6 +5247,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     evaluate = sub.add_parser("evaluate", help="Evaluate all completion gates")
     evaluate.set_defaults(func=cmd_evaluate)
+
+    disposition = sub.add_parser(
+        "disposition",
+        help="Classify every remaining review/adversarial concern for completion",
+    )
+    disposition.add_argument(
+        "--file", required=True, help="Completion-disposition JSON artifact"
+    )
+    disposition.set_defaults(func=cmd_disposition)
+
+    continuation_context = sub.add_parser(
+        "continuation-context",
+        help="Emit bounded context for resuming an existing run in a fresh session",
+    )
+    continuation_context.add_argument("--json", action="store_true")
+    continuation_context.set_defaults(func=cmd_continuation_context)
+
+    start_followup = sub.add_parser(
+        "start-followup-run",
+        help="Start a semantically new run from selected durable follow-ups",
+    )
+    start_followup.add_argument(
+        "--follow-up-id", action="append", required=True, help="Selected FU-NNN id"
+    )
+    start_followup.add_argument("--label")
+    start_followup.set_defaults(func=cmd_start_followup_run)
 
     usage_report = sub.add_parser(
         "usage-report", help="Per-phase Codex usage regression table"

@@ -25,4 +25,15 @@ Then:
 7. Update affected documentation and examples.
 8. Set the phase to `implemented` when implementation is complete.
 
+Record structured completion metadata before setting the phase:
+
+```bash
+controller.py record-work-result --kind implementation --file <work-result.json>
+```
+
+The JSON may contain `ui_review.groups` and/or `ui_review.scenarios`. For material visual changes,
+use repository guidance or the renderer's `--list` command to select the smallest useful set of
+real registered states, including important adjacent regression risks. Do not invent IDs or select
+all scenarios merely because UI code changed. Omit `ui_review` for non-visual work.
+
 Never push, merge, deploy, access production, rotate credentials, or apply irreversible migrations.

@@ -17,6 +17,8 @@ REVIEW = "schemas/review.schema.json"
 REVIEW_DELTA = "schemas/review-delta.schema.json"
 ADVERSARIAL = "schemas/adversarial-review.schema.json"
 TRIAGE = "schemas/triage.schema.json"
+WORK_RESULT = "schemas/work-result.schema.json"
+COMPLETION_DISPOSITION = "schemas/completion-disposition.schema.json"
 
 
 def _valid_review() -> dict:
@@ -76,6 +78,27 @@ class ValidatorPositiveTests(unittest.TestCase):
         payload = _valid_review()
         payload["findings"] = [_valid_finding(file=None, line_start=None)]
         validate_payload(payload, REVIEW)
+
+    def test_completion_disposition_valid(self) -> None:
+        validate_payload(
+            {
+                "summary": "defer hardening",
+                "findings": [{
+                    "source_phase": "adversarial", "source_round": 8,
+                    "source_id": "A-8-T-1", "title": "Crash recovery",
+                    "severity": "medium", "category": "data_loss",
+                    "description": "Hard-crash recovery hardening",
+                    "impact": "additional_hardening", "disposition": "FIX_LATER",
+                    "rationale": "Outside accepted early scope", "evidence": "tests pass",
+                    "relevant_acceptance_criteria": ["AC-1"], "relevant_files": ["db.py"],
+                    "suggested_future_scope": "transactional persistence",
+                    "recommended_verification": ["crash injection"],
+                    "human_input_eventually_required": False,
+                    "provenance": "adversarial-08.codex.json#threats/0",
+                }],
+            },
+            COMPLETION_DISPOSITION,
+        )
 
 
 class ValidatorNegativeTests(unittest.TestCase):
@@ -179,6 +202,7 @@ class TriageSchemaTests(unittest.TestCase):
         with self.assertRaises(SchemaValidationError):
             validate_payload([{"fingerprint": "", "status": "rejected"}], TRIAGE)
 
+
     def test_unknown_status_rejected(self) -> None:
         with self.assertRaises(SchemaValidationError) as ctx:
             validate_payload(
@@ -214,6 +238,27 @@ class TriageSchemaTests(unittest.TestCase):
                         TRIAGE,
                     )
                 self.assertIn("/0/finding_id", str(ctx.exception))
+
+
+class WorkResultSchemaTests(unittest.TestCase):
+    def test_ui_review_is_optional(self) -> None:
+        validate_payload({"summary": "non-visual change"}, WORK_RESULT)
+        validate_payload({}, WORK_RESULT)
+
+    def test_scenarios_and_groups_are_validated(self) -> None:
+        validate_payload(
+            {
+                "ui_review": {
+                    "scenarios": ["reference.add-range", "reference.dark"],
+                    "groups": ["reference-library"],
+                }
+            },
+            WORK_RESULT,
+        )
+        with self.assertRaises(SchemaValidationError):
+            validate_payload(
+                {"ui_review": {"scenarios": ["../invented"]}}, WORK_RESULT
+            )
 
 
 class JsonPointerEscapingTests(unittest.TestCase):

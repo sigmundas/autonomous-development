@@ -24,3 +24,8 @@ disallowed-tools: AskUserQuestion
 6. Rerun all affected verification checks using the controller.
 7. Do not automatically implement low-confidence stylistic suggestions.
 8. Do not exceed the configured review-round budget; mark the run blocked when a safe resolution requires external product or operational authority.
+9. If fixes change UI evidence relevance, record a structured result with
+   `controller.py record-work-result --kind fix --file <fix-result.json>`. The optional
+   `ui_review.groups`/`ui_review.scenarios` selection replaces the previous selection; omitting it
+   preserves the prior selection for re-review. Use only repository-registered IDs and choose the
+   smallest useful changed plus adjacent-risk set.

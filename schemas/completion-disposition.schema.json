@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Completion finding dispositions",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings"],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_phase", "source_round", "source_id", "title", "severity",
+          "category", "description", "impact", "disposition", "rationale",
+          "relevant_acceptance_criteria", "relevant_files", "suggested_future_scope",
+          "recommended_verification", "human_input_eventually_required", "provenance"
+        ],
+        "properties": {
+          "source_phase": {"enum": ["review", "adversarial"]},
+          "source_round": {"type": "integer", "minimum": 1},
+          "source_id": {"type": "string", "minLength": 1},
+          "title": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["critical", "high", "medium", "low", "unknown"]},
+          "category": {"type": "string", "minLength": 1},
+          "description": {"type": "string", "minLength": 1},
+          "impact": {
+            "enum": [
+              "acceptance_criterion", "ordinary_use_correctness", "realistic_data_loss",
+              "security_privacy_authz", "destructive_irreversible", "required_compatibility",
+              "required_verification", "feature_not_satisfied", "additional_hardening",
+              "out_of_scope", "incorrect_or_mitigated", "product_scientific_decision"
+            ]
+          },
+          "disposition": {
+            "enum": [
+              "MUST_FIX_NOW", "FIX_LATER", "ACCEPTED_WITH_EVIDENCE",
+              "HUMAN_DECISION_REQUIRED"
+            ]
+          },
+          "rationale": {"type": "string", "minLength": 1},
+          "evidence": {"type": "string"},
+          "relevant_acceptance_criteria": {
+            "type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true
+          },
+          "relevant_files": {
+            "type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true
+          },
+          "suggested_future_scope": {"type": "string"},
+          "recommended_verification": {
+            "type": "array", "items": {"type": "string", "minLength": 1}
+          },
+          "human_input_eventually_required": {"type": "boolean"},
+          "provenance": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

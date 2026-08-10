@@ -119,6 +119,8 @@ def main() -> int:
         ROOT / "schemas/review-delta.schema.json",
         ROOT / "schemas/accept-decisions.schema.json",
         ROOT / "schemas/triage.schema.json",
+        ROOT / "schemas/work-result.schema.json",
+        ROOT / "schemas/completion-disposition.schema.json",
         ROOT / "skills/autonomous-feature/references/specification.md",
         ROOT / "skills/autonomous-feature/references/planning.md",
         ROOT / "skills/autonomous-feature/references/implementation.md",

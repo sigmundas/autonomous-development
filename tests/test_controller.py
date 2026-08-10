@@ -1661,7 +1661,7 @@ class ControllerTests(unittest.TestCase):
         )
 
     def test_review_budget_exhausted_is_recoverable_and_marks_stale_evidence(self) -> None:
-        """Exhaustion preserves work and waits for an explicit human decision."""
+        """Exhaustion preserves work and routes to disposition, not an automatic block."""
         import json as _json
 
         repo = self.make_repo()
@@ -1713,8 +1713,9 @@ class ControllerTests(unittest.TestCase):
 
         final_state = _json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(final_state["status"], "active")
-        self.assertEqual(final_state["phase"], "review-budget-exhausted")
-        self.assertTrue(final_state["awaiting_human_decision"])
+        self.assertEqual(final_state["phase"], "completion-evaluation")
+        self.assertFalse(final_state["awaiting_human_decision"])
+        self.assertEqual(final_state["recovery"]["recommended_action"], "disposition")
         self.assertTrue(final_state["recovery"]["work_preserved"])
         self.assertEqual(
             final_state["cumulative_acceptance_criteria"][0]["assessment_state"],
@@ -1737,6 +1738,162 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(controller.effective_review_limit(final_state), 4)
         self.assertEqual(len(final_state["human_overrides"]), 1)
         self.assertEqual(config_path.read_bytes(), config_before)
+
+    def test_adversarial_hardening_completes_with_followups_and_starts_new_run(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.assertEqual(
+            self.run_controller(repo, "init", "--feature", "Early persistence test feature", state_home=state_home).returncode,
+            0,
+        )
+        state_path = self._find_state_path(repo, state_home)
+        run_dir = state_path.parent
+        (run_dir / "accepted-spec.md").write_text("AC-1: early/test-scope behavior", encoding="utf-8")
+        (run_dir / "accepted-plan.md").write_text("plan", encoding="utf-8")
+        review = {
+            "verdict": "pass", "summary": "pass", "findings": [],
+            "verification_gaps": [],
+            "acceptance_criteria_assessment": [{"id": "AC-1", "status": "satisfied", "evidence": "tests"}],
+            "confidence": 1.0,
+        }
+        (run_dir / "review-03.codex.json").write_text(json.dumps(review), encoding="utf-8")
+        threats = [
+            ("migration", "Preserve legacy row identity across repeated legacy writes"),
+            ("data_loss", "Hard-crash safety between separate persistence commits"),
+            ("concurrency", "Concurrent writers can create duplicates"),
+        ]
+        adversarial = {
+            "verdict": "changes_required", "summary": "hardening remains",
+            "threats": [
+                {"severity": "medium", "area": area, "scenario": title, "evidence": "architectural edge case", "mitigation": "future hardening"}
+                for area, title in threats
+            ],
+            "failure_scenarios": [title for _, title in threats],
+            "required_actions": ["consider future hardening"], "confidence": 0.9,
+        }
+        (run_dir / "adversarial-08.codex.json").write_text(json.dumps(adversarial), encoding="utf-8")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.update({
+            "review_round": 3,
+            "reviews": [{"round": 3, "path": "review-03.codex.json", "verdict": "pass"}],
+            "adversarial_reviews": [{"round": 8, "path": "adversarial-08.codex.json", "verdict": "changes_required"}],
+            "cumulative_acceptance_criteria": [{"id": "AC-1", "status": "satisfied", "evidence": "tests", "round": 3}],
+            "verification": {"checks": [{"name": "focused", "exit_code": 0}, {"name": "pytest", "exit_code": 0}], "passed": True},
+            "risk": {"requires_adversarial_review": True, "reasons": ["persistence"]},
+        })
+        state["artifacts"].update({"accepted_spec": "accepted-spec.md", "accepted_plan": "accepted-plan.md"})
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        disposition = {
+            "summary": "All remaining threats are additional hardening outside the early feature scope.",
+            "findings": [
+                {
+                    "source_phase": "adversarial", "source_round": 8,
+                    "source_id": f"A-8-T-{index}", "title": title,
+                    "severity": "medium", "category": area, "description": title,
+                    "impact": "additional_hardening", "disposition": "FIX_LATER",
+                    "rationale": "Required AC and ordinary supported behavior are satisfied; this is architectural hardening.",
+                    "evidence": "focused and broader verification pass",
+                    "relevant_acceptance_criteria": ["AC-1"], "relevant_files": ["persistence.py"],
+                    "suggested_future_scope": title, "recommended_verification": ["add a focused regression test"],
+                    "human_input_eventually_required": False,
+                    "provenance": f"adversarial-08.codex.json#threats/{index - 1}",
+                }
+                for index, (area, title) in enumerate(threats, start=1)
+            ],
+        }
+        disposition_path = run_dir / "disposition-input.json"
+        disposition_path.write_text(json.dumps(disposition), encoding="utf-8")
+        recorded = self.run_controller(repo, "disposition", "--file", str(disposition_path), state_home=state_home)
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        evaluated = self.run_controller(repo, "evaluate", state_home=state_home)
+        self.assertEqual(evaluated.returncode, 0, evaluated.stderr)
+        completed = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(completed["status"], "complete_with_followups")
+        followups = json.loads((run_dir / "follow-ups.json").read_text(encoding="utf-8"))["follow_ups"]
+        self.assertEqual(len(followups), 3)
+        self.assertEqual(followups[0]["original_finding_id"], "A-8-T-1")
+        self.assertEqual(followups[0]["source_run_id"], completed["run_id"])
+
+        context = self.run_controller(repo, "--run-id", completed["run_id"], "continuation-context", "--json", state_home=state_home)
+        self.assertEqual(context.returncode, 0, context.stderr)
+        self.assertLess(len(context.stdout), 20_000)
+        child = self.run_controller(repo, "--run-id", completed["run_id"], "start-followup-run", "--follow-up-id", "FU-001", state_home=state_home)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        child_state = find_active_runs(state_home, resolve_repository(repo).id)[0].state
+        self.assertEqual(child_state["parent_run_id"], completed["run_id"])
+        self.assertEqual(child_state["follow_up_source"]["selected_ids"], ["FU-001"])
+
+    def test_required_acceptance_criterion_cannot_be_deferred(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "Feature", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        run_dir = state_path.parent
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["cumulative_findings"] = [{"id": "F-1", "severity": "high", "status": "open", "round": 1, "description": "AC is unmet"}]
+        state["cumulative_acceptance_criteria"] = [{"id": "AC-1", "status": "not_satisfied", "evidence": "missing", "round": 1}]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        payload = {
+            "summary": "bad deferral",
+            "findings": [{
+                "source_phase": "review", "source_round": 1, "source_id": "F-1", "title": "Unmet AC",
+                "severity": "high", "category": "correctness", "description": "AC is unmet",
+                "impact": "acceptance_criterion", "disposition": "FIX_LATER", "rationale": "defer",
+                "evidence": "", "relevant_acceptance_criteria": ["AC-1"], "relevant_files": [],
+                "suggested_future_scope": "later", "recommended_verification": [],
+                "human_input_eventually_required": False, "provenance": "review-01.codex.json#F-1",
+            }],
+        }
+        path = run_dir / "bad-disposition.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        result = self.run_controller(repo, "disposition", "--file", str(path), state_home=state_home)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hard-blocking impact", result.stderr)
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["cumulative_acceptance_criteria"] = [{"id": "AC-1", "status": "satisfied", "evidence": "ok", "round": 1}]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        payload["findings"][0].update({
+            "title": "Current-path credential exposure",
+            "description": "Supported requests expose credentials",
+            "impact": "security_privacy_authz",
+            "relevant_acceptance_criteria": [],
+        })
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        security = self.run_controller(repo, "disposition", "--file", str(path), state_home=state_home)
+        self.assertNotEqual(security.returncode, 0)
+        self.assertIn("must be MUST_FIX_NOW", security.stderr)
+
+    def test_product_scientific_ambiguity_pauses_at_source_phase(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "Scientific semantics", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        run_dir = state_path.parent
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["cumulative_findings"] = [{"id": "F-1", "severity": "medium", "status": "open", "round": 1, "description": "Two scientific interpretations are defensible"}]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        payload = {
+            "summary": "Product authority is required",
+            "findings": [{
+                "source_phase": "review", "source_round": 1, "source_id": "F-1", "title": "Choose scientific interpretation",
+                "severity": "medium", "category": "scientific", "description": "Two interpretations are defensible",
+                "impact": "product_scientific_decision", "disposition": "HUMAN_DECISION_REQUIRED",
+                "rationale": "Choose whether measurements use interpretation A or B.", "evidence": "Both match existing sources.",
+                "relevant_acceptance_criteria": [], "relevant_files": ["science.py"], "suggested_future_scope": "implement selected semantics",
+                "recommended_verification": ["scientific fixture"], "human_input_eventually_required": True,
+                "provenance": "review-01.codex.json#F-1",
+            }],
+        }
+        path = run_dir / "human-disposition.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        result = self.run_controller(repo, "disposition", "--file", str(path), state_home=state_home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        paused = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertTrue(paused["awaiting_human_decision"])
+        self.assertEqual(paused["awaiting_human_decision_phase"], "review")
+        self.assertIn("interpretation A or B", paused["awaiting_human_decision_reason"])
 
     def test_blocked_run_continuation_carries_context_and_links_parent(self) -> None:
         repo = self.make_repo()
@@ -1946,7 +2103,7 @@ class ControllerTests(unittest.TestCase):
         )
 
 
-TERMINAL_STATUSES = ("complete", "blocked", "cancelled", "archived")
+TERMINAL_STATUSES = ("complete", "complete_with_followups", "blocked", "cancelled", "archived")
 
 
 class TerminalStateIntegrityTests(unittest.TestCase):
@@ -2034,6 +2191,8 @@ class TerminalStateIntegrityTests(unittest.TestCase):
         )
         spec = ledger_dir / "spec.md"
         spec.write_text("spec", encoding="utf-8")
+        work_result = ledger_dir / "work-result.json"
+        work_result.write_text("{}", encoding="utf-8")
         return [
             ("run-check", ["run-check", "--name", "t", "--", "python3", "-c", "print(1)"]),
             ("set-phase", ["set-phase", "--phase", "planning"]),
@@ -2041,6 +2200,16 @@ class TerminalStateIntegrityTests(unittest.TestCase):
             ("evaluate", ["evaluate"]),
             ("accept-drift", ["accept-drift"]),
             ("triage", ["triage", "--file", str(ledger)]),
+            (
+                "record-work-result",
+                [
+                    "record-work-result",
+                    "--kind",
+                    "implementation",
+                    "--file",
+                    str(work_result),
+                ],
+            ),
             ("accept", ["accept", "--kind", "spec", "--file", str(spec)]),
             ("codex", ["codex", "--phase", "review"]),
         ]

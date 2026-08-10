@@ -3,7 +3,8 @@
 The structured boundaries the controller currently validates here against a
 bundled Draft 2020-12 schema — *before* the payload is published to a canonical
 artifact or merged into run state — are the Codex enhance/plan/review outputs,
-the reconciliation source and decision delta, and the triage ledger.
+the reconciliation source and decision delta, the triage ledger, and implementation/fix
+work-result metadata.
 (Persisted run-state validation is not wired through this module yet; it is
 deferred until the run-state schema is finalized.)
 
