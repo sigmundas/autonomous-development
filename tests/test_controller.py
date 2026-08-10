@@ -1660,8 +1660,8 @@ class ControllerTests(unittest.TestCase):
             json.loads(state_path.read_text(encoding="utf-8")).get("reviews", []), []
         )
 
-    def test_review_budget_exhausted_sets_blocked(self) -> None:
-        """cmd_codex --phase review over budget must atomically set status=blocked."""
+    def test_review_budget_exhausted_is_recoverable_and_marks_stale_evidence(self) -> None:
+        """Exhaustion preserves work and waits for an explicit human decision."""
         import json as _json
 
         repo = self.make_repo()
@@ -1688,7 +1688,23 @@ class ControllerTests(unittest.TestCase):
             {"name": "t", "exit_code": 0, "passed": True}
         ]
         state["verification"]["passed"] = True
+        state["cumulative_acceptance_criteria"] = [
+            {"id": "AC-1", "status": "partially_satisfied", "evidence": "round 3", "round": 3}
+        ]
+        state["reviews"] = [
+            {
+                "round": 3,
+                "path": "review-03.codex.json",
+                "verdict": "changes_required",
+                "delta": True,
+                "checkpoint": controller.capture_review_checkpoint(
+                    resolve_repository(repo), state, checkpoint_id="review-03"
+                ),
+            }
+        ]
         state_path.write_text(_json.dumps(state), encoding="utf-8")
+        # Simulate the final finding being fixed/reverted after round 3.
+        (repo / "README.md").write_text("# Test\nfixed\n", encoding="utf-8")
 
         result = self.run_controller(
             repo, "codex", "--phase", "review", state_home=state_home
@@ -1696,8 +1712,238 @@ class ControllerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
         final_state = _json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(final_state["status"], "blocked")
+        self.assertEqual(final_state["status"], "active")
         self.assertEqual(final_state["phase"], "review-budget-exhausted")
+        self.assertTrue(final_state["awaiting_human_decision"])
+        self.assertTrue(final_state["recovery"]["work_preserved"])
+        self.assertEqual(
+            final_state["cumulative_acceptance_criteria"][0]["assessment_state"],
+            "needs_reassessment",
+        )
+
+        config_path = state_home / "config.toml"
+        config_path.write_text("[workflow]\nmax_review_rounds = 3\n", encoding="utf-8")
+        config_before = config_path.read_bytes()
+        authorized = self.run_controller(
+            repo,
+            "authorize-review",
+            "--reason",
+            "Confirm the final fix",
+            state_home=state_home,
+        )
+        self.assertEqual(authorized.returncode, 0, authorized.stderr)
+        final_state = _json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(final_state["max_review_rounds"], 3)
+        self.assertEqual(controller.effective_review_limit(final_state), 4)
+        self.assertEqual(len(final_state["human_overrides"]), 1)
+        self.assertEqual(config_path.read_bytes(), config_before)
+
+    def test_blocked_run_continuation_carries_context_and_links_parent(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "Feature", state_home=state_home)
+        parent_path = self._find_state_path(repo, state_home)
+        parent_id = json.loads(parent_path.read_text(encoding="utf-8"))["run_id"]
+        parent_dir = parent_path.parent
+        (parent_dir / "accepted-spec.md").write_text("SPEC\n", encoding="utf-8")
+        (parent_dir / "accepted-plan.md").write_text("PLAN\n", encoding="utf-8")
+        state = json.loads(parent_path.read_text(encoding="utf-8"))
+        state["artifacts"].update(
+            {"accepted_spec": "accepted-spec.md", "accepted_plan": "accepted-plan.md"}
+        )
+        state["verification"] = {
+            "passed": True,
+            "checks": [{"name": "unit", "command": ["true"], "exit_code": 0}],
+        }
+        state["cumulative_findings"] = [
+            {"id": "F-1", "severity": "high", "status": "open", "description": "remaining"}
+        ]
+        state["cumulative_acceptance_criteria"] = [
+            {"id": "AC-1", "status": "partially_satisfied", "evidence": "old", "round": 1}
+        ]
+        parent_path.write_text(json.dumps(state), encoding="utf-8")
+        blocked = self.run_controller(
+            repo, "block", "--reason", "Autonomous retry exhausted", state_home=state_home
+        )
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        parent_after_block = parent_path.read_bytes()
+
+        continued = self.run_controller(
+            repo, "--run-id", parent_id, "continue-run", state_home=state_home
+        )
+        self.assertEqual(continued.returncode, 0, continued.stderr)
+        child = find_active_runs(state_home, resolve_repository(repo).id)[0]
+        self.assertNotEqual(child.run_id, parent_id)
+        self.assertEqual(child.state["parent_run_id"], parent_id)
+        self.assertEqual(
+            child.state["continuation"]["reason_previous_run_stopped"],
+            "Autonomous retry exhausted",
+        )
+        self.assertEqual(child.state["cumulative_findings"][0]["id"], "F-1")
+        self.assertEqual(
+            child.state["cumulative_acceptance_criteria"][0]["status"],
+            "partially_satisfied",
+        )
+        self.assertEqual(
+            child.state["cumulative_acceptance_criteria"][0]["evidence"], "old"
+        )
+        self.assertTrue((child.run_dir / "accepted-spec.md").exists())
+        self.assertTrue(child.state["verification"]["passed"])
+        repeated = self.run_controller(
+            repo, "--run-id", parent_id, "continue-run", state_home=state_home
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        repeated_payload = json.loads(repeated.stdout)
+        self.assertEqual(repeated_payload["run_id"], child.run_id)
+        self.assertTrue(repeated_payload["reused"])
+        self.assertEqual(
+            len(find_active_runs(state_home, resolve_repository(repo).id)), 1
+        )
+        self.assertEqual(parent_path.read_bytes(), parent_after_block)
+
+    def test_terminal_review_recovery_authorizes_only_linked_continuation(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "Feature", state_home=state_home)
+        parent_path = self._find_state_path(repo, state_home)
+        parent_state = json.loads(parent_path.read_text(encoding="utf-8"))
+        parent_id = parent_state["run_id"]
+        parent_state["phase"] = "review-budget-exhausted"
+        parent_state["review_round"] = parent_state["max_review_rounds"]
+        parent_path.write_text(json.dumps(parent_state), encoding="utf-8")
+        self.run_controller(
+            repo, "block", "--reason", "Review budget exhausted", state_home=state_home
+        )
+        terminal_parent = parent_path.read_bytes()
+
+        continued = self.run_controller(
+            repo,
+            "--run-id",
+            parent_id,
+            "continue-run",
+            "--intent",
+            "allow-one-more-review",
+            state_home=state_home,
+        )
+        self.assertEqual(continued.returncode, 0, continued.stderr)
+        child_id = json.loads(continued.stdout)["run_id"]
+        authorized = self.run_controller(
+            repo, "--run-id", child_id, "authorize-review", state_home=state_home
+        )
+        self.assertEqual(authorized.returncode, 0, authorized.stderr)
+        child = find_active_runs(state_home, resolve_repository(repo).id)[0]
+        self.assertEqual(child.run_id, child_id)
+        self.assertEqual(
+            child.state["continuation"]["intended_recovery_action"],
+            "allow-one-more-review",
+        )
+        self.assertEqual(len(child.state["review_round_authorizations"]), 1)
+        self.assertEqual(
+            child.state["review_round_authorizations"][0]["recovery_parent_run_id"],
+            parent_id,
+        )
+        self.assertEqual(parent_path.read_bytes(), terminal_parent)
+
+        repeated = self.run_controller(
+            repo, "--run-id", child_id, "authorize-review", state_home=state_home
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertTrue(json.loads(repeated.stdout)["reused"])
+        child_state = json.loads((child.run_dir / "run-state.json").read_text())
+        self.assertEqual(len(child_state["review_round_authorizations"]), 1)
+
+    def test_terminal_adversarial_recovery_records_intent_on_continuation(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "Feature", state_home=state_home)
+        parent_path = self._find_state_path(repo, state_home)
+        parent_dir = parent_path.parent
+        parent_state = json.loads(parent_path.read_text(encoding="utf-8"))
+        parent_id = parent_state["run_id"]
+        (parent_dir / "accepted-spec.md").write_text("SPEC\n", encoding="utf-8")
+        (parent_dir / "accepted-plan.md").write_text("PLAN\n", encoding="utf-8")
+        (parent_dir / "review-01.codex.json").write_text(
+            json.dumps({"verdict": "pass"}), encoding="utf-8"
+        )
+        parent_state["artifacts"].update(
+            {"accepted_spec": "accepted-spec.md", "accepted_plan": "accepted-plan.md"}
+        )
+        parent_state["verification"] = {
+            "passed": True,
+            "checks": [{"name": "unit", "command": ["true"], "exit_code": 0}],
+        }
+        parent_state["reviews"] = [
+            {
+                "round": 1,
+                "path": "review-01.codex.json",
+                "verdict": "pass",
+                "delta": False,
+            }
+        ]
+        parent_state["review_round"] = 1
+        parent_state["risk"] = {
+            "requires_adversarial_review": True,
+            "reasons": ["rigorous mode"],
+        }
+        parent_path.write_text(json.dumps(parent_state), encoding="utf-8")
+        self.run_controller(
+            repo, "block", "--reason", "Missing adversarial review", state_home=state_home
+        )
+        result = self.run_controller(
+            repo,
+            "--run-id",
+            parent_id,
+            "continue-run",
+            "--intent",
+            "resume-adversarial",
+            state_home=state_home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        child = find_active_runs(state_home, resolve_repository(repo).id)[0]
+        self.assertEqual(
+            child.state["continuation"]["intended_recovery_action"],
+            "resume-adversarial",
+        )
+        # Emulate a continuation created by the previous controller version,
+        # which kept inherited_reviews but left canonical reviews empty.
+        child_path = child.run_dir / "run-state.json"
+        legacy_child = json.loads(child_path.read_text(encoding="utf-8"))
+        legacy_child["reviews"] = []
+        child_path.write_text(json.dumps(legacy_child), encoding="utf-8")
+        reused = self.run_controller(
+            repo,
+            "--run-id",
+            parent_id,
+            "continue-run",
+            "--intent",
+            "resume-adversarial",
+            state_home=state_home,
+        )
+        self.assertEqual(reused.returncode, 0, reused.stderr)
+        self.assertTrue(json.loads(reused.stdout)["reused"])
+        child = find_active_runs(state_home, resolve_repository(repo).id)[0]
+        self.assertTrue(child.state["reviews"])
+        next_action = self.run_controller(
+            repo, "--run-id", child.run_id, "next-action", state_home=state_home
+        )
+        self.assertEqual(next_action.returncode, 0, next_action.stderr)
+        self.assertEqual(json.loads(next_action.stdout)["phase"], "adversarial")
+
+    def test_cancelled_run_cannot_be_continued(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "Feature", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        run_id = json.loads(state_path.read_text(encoding="utf-8"))["run_id"]
+        self.run_controller(repo, "cancel", state_home=state_home)
+        result = self.run_controller(
+            repo, "--run-id", run_id, "continue-run", state_home=state_home
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("only allowed for blocked runs", result.stderr)
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8"))["status"], "cancelled"
+        )
 
 
 TERMINAL_STATUSES = ("complete", "blocked", "cancelled", "archived")
@@ -3352,6 +3598,18 @@ class AwaitingHumanDecisionTests(unittest.TestCase):
         )
         # Counter incremented — this proves the hook did fire on this run.
         self.assertEqual(state.get("stop_gate_blocks"), 1)
+
+    def test_genuine_stop_retry_exhaustion_still_blocks(self) -> None:
+        repo = self._make_repo()
+        state_home = self._make_state_home()
+        self._run_controller(repo, "init", "--feature", "F", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        for _ in range(4):
+            result = self._invoke_stop_hook(repo, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "blocked")
+        self.assertEqual(state["phase"], "stop-gate-budget-exhausted")
 
     def test_resume_clears_awaiting_human_decision(self) -> None:
         repo = self._make_repo()

@@ -52,6 +52,13 @@ from state import (
     LEGACY_STATE_REL,
 )
 from schema_validation import SchemaValidationError, validate_payload
+from ui_evidence import (
+    UIEvidenceResult,
+    codex_supports_images,
+    looks_like_image_input_failure,
+    render_ui_evidence,
+    visual_prompt,
+)
 import config as user_config
 from config import ConfigError
 
@@ -958,6 +965,45 @@ def changed_paths_since_last_review(
     return sorted(changed)
 
 
+def effective_review_limit(state: dict[str, Any]) -> int:
+    """Original snapshotted budget plus explicit, run-local human grants."""
+    base = int(state.get("max_review_rounds", 3))
+    grants = state.get("review_round_authorizations", [])
+    if not isinstance(grants, list):
+        return base
+    return base + sum(
+        int(grant.get("additional_rounds", 0))
+        for grant in grants
+        if isinstance(grant, dict)
+        and isinstance(grant.get("additional_rounds"), int)
+        and grant.get("additional_rounds", 0) > 0
+    )
+
+
+def mark_review_evidence_stale_if_changed(
+    repo: RepoInfo, state: dict[str, Any]
+) -> list[str]:
+    """Mark review-derived facts stale when code changed after their checkpoint."""
+    changed = changed_paths_since_last_review(repo, state)
+    if not changed:
+        return []
+    latest_round = int(state.get("review_round", 0))
+    stale = {
+        "state": "needs_reassessment",
+        "after_review_round": latest_round,
+        "changed_paths": changed,
+        "detected_at": utc_now(),
+    }
+    state["review_evidence"] = stale
+    for criterion in state.get("cumulative_acceptance_criteria", []):
+        if isinstance(criterion, dict) and int(criterion.get("round", 0)) <= latest_round:
+            criterion["assessment_state"] = "needs_reassessment"
+    for finding in state.get("cumulative_findings", []):
+        if isinstance(finding, dict):
+            finding["assessment_state"] = "needs_reassessment"
+    return changed
+
+
 def render_changed_since_previous(repo: RepoInfo, state: dict[str, Any]) -> str:
     changed = changed_paths_since_last_review(repo, state)
     if changed is None:
@@ -1089,6 +1135,7 @@ def _cumulative_finding(
         "round_opened": round_num,
         "round_last_seen": round_num,
         "origin": origin,
+        "assessment_state": "current",
     }
     for key, default in _FINDING_EVIDENCE_DEFAULTS.items():
         entry[key] = finding.get(key, default)
@@ -1172,6 +1219,9 @@ def merge_full_review(state: dict[str, Any], parsed: dict[str, Any], round_num: 
             origin="full",
         )
     state["cumulative_findings"] = _finalize_cumulative(index)
+    for finding in state["cumulative_findings"]:
+        if isinstance(finding, dict) and finding.get("round_last_seen") == round_num:
+            finding["assessment_state"] = "current"
 
 
 def merge_delta_review(
@@ -1219,6 +1269,7 @@ def merge_delta_review(
             )
         finding = index[fid]
         finding["status"] = "resolved"
+        finding["assessment_state"] = "current"
         finding["resolved_at_round"] = round_num
         finding["resolution_source"] = resolution_source
     incoming_ids = [str(f["id"]) for f in new_findings] + [
@@ -1358,6 +1409,7 @@ def merge_acceptance_criteria(
             "status": item.get("status"),
             "evidence": item.get("evidence", ""),
             "round": round_num,
+            "assessment_state": "current",
         }
     state["cumulative_acceptance_criteria"] = list(index.values())
 
@@ -1383,7 +1435,10 @@ def cumulative_unresolved_severe(state: dict[str, Any]) -> list[dict[str, Any]]:
             severe.append({"id": "(malformed)", "status": "open", "severity": "high"})
             continue
         is_severe = f.get("severity") not in NON_SEVERE_SEVERITIES
-        released = f.get("status") in NON_BLOCKING_TRIAGE_STATUSES
+        released = (
+            f.get("status") in NON_BLOCKING_TRIAGE_STATUSES
+            and f.get("assessment_state") != "needs_reassessment"
+        )
         if is_severe and not released:
             severe.append(f)
     return severe
@@ -1403,7 +1458,10 @@ def blocking_acceptance_criteria(state: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(criterion, dict):
             blocking.append({"id": "(malformed)", "status": "(unknown)"})
             continue
-        if criterion.get("status") != SATISFIED_ACCEPTANCE_STATUS:
+        if (
+            criterion.get("status") != SATISFIED_ACCEPTANCE_STATUS
+            or criterion.get("assessment_state") == "needs_reassessment"
+        ):
             blocking.append(criterion)
     return blocking
 
@@ -1772,7 +1830,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
     is_delta_review = False
     if phase == "review":
         next_round = int(state.get("review_round", 0)) + 1
-        maximum = int(state.get("max_review_rounds", 3))
+        maximum = effective_review_limit(state)
         if next_round > maximum:
             with RunStateLock(run_dir):
                 fresh = load_run_state(run_dir)
@@ -1793,14 +1851,26 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 # exhausted, do not block on the stale pre-lock decision — signal a
                 # retryable state change instead.
                 fresh_round = int(fresh.get("review_round", 0)) + 1
-                fresh_max = int(fresh.get("max_review_rounds", 3))
+                fresh_max = effective_review_limit(fresh)
                 if fresh_round <= fresh_max:
                     raise WorkflowError(
                         "Review budget changed concurrently (now round "
                         f"{fresh_round} of {fresh_max}); retry the review."
                     )
-                fresh["status"] = "blocked"
                 fresh["phase"] = "review-budget-exhausted"
+                fresh["awaiting_human_decision"] = True
+                fresh["awaiting_human_decision_reason"] = (
+                    "Review budget exhausted; a human must authorize one additional "
+                    "confirmation review or choose a follow-up continuation."
+                )
+                changed = mark_review_evidence_stale_if_changed(repo, fresh)
+                fresh["recovery"] = {
+                    "kind": "review-budget-exhausted",
+                    "work_preserved": True,
+                    "verification_preserved": True,
+                    "recommended_action": "allow-one-more-review",
+                    "changed_since_review": changed,
+                }
                 fresh.setdefault("notes", []).append(
                     f"Maximum review rounds exhausted ({fresh_max})"
                 )
@@ -1831,24 +1901,47 @@ def cmd_codex(args: argparse.Namespace) -> int:
         output_name = static_output
         assert output_name is not None
 
+    # Renderer output is invocation-unique until the review result is committed.
+    # This prevents concurrent retries from sharing or mislabeling screenshots.
+    stage_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    evidence_result = UIEvidenceResult("not_configured", False)
+    images_attached = False
+    if phase in {"review", "adversarial"}:
+        evidence_phase_label = (
+            f"review-{next_round:02d}"
+            if phase == "review"
+            else f"adversarial-{index:02d}"
+        )
+        evidence_result = render_ui_evidence(
+            repo.canonical_root,
+            run_dir / f".staging-{stage_id}.{evidence_phase_label}.ui-evidence",
+            run_process,
+        )
+        if evidence_result.available:
+            images_attached = codex_supports_images(run_process, repo.canonical_root)
+            if not images_attached:
+                evidence_result.detail = (
+                    "installed Codex CLI does not advertise local --image input"
+                )
+
     template = (PLUGIN_ROOT / prompt_rel).read_text(encoding="utf-8")
     values = prompt_values(run_dir, state)
     if is_delta_review:
         values["CHANGED_SINCE_LAST_REVIEW"] = render_changed_since_previous(repo, state)
-    prompt = render(template, values)
+    base_prompt = render(template, values)
+    prompt = base_prompt + visual_prompt(evidence_result, images_attached)
     prompt_path = run_dir / f"{phase}.prompt.md"
     prompt_path.write_text(prompt, encoding="utf-8")
     # Stage Codex output/events under invocation-unique names so a concurrent or
     # overlapping retry of the same phase cannot clobber this invocation's
     # artifacts; the canonical round files are published under the lock below.
-    stage_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     output_path = run_dir / f".staging-{stage_id}.codex.json"
 
     snapshot = state.get("config_snapshot") if isinstance(state, dict) else None
     profile, profile_id = resolve_phase_execution(
         phase, snapshot=snapshot if isinstance(snapshot, dict) else None
     )
-    command = [
+    command_without_images = [
         "codex",
         "exec",
         "--json",
@@ -1859,8 +1952,13 @@ def cmd_codex(args: argparse.Namespace) -> int:
         "--output-last-message",
         str(output_path),
         *codex_profile_args(profile, profile_id=profile_id),
-        "-",
     ]
+    image_args = [
+        argument
+        for image_path in (evidence_result.image_paths or [])
+        for argument in ("--image", str(image_path))
+    ] if images_attached else []
+    command = [*command_without_images, *image_args, "-"]
     started_at = utc_now()
     started_monotonic = time.monotonic()
     result = run_process(
@@ -1869,6 +1967,24 @@ def cmd_codex(args: argparse.Namespace) -> int:
         input_text=prompt,
         timeout=getattr(args, "timeout", None),
     )
+    # A CLI can advertise --image while the selected provider/model rejects
+    # visual input. Retry only that recognizable capability failure, preserving
+    # screenshots as artifacts but making the fallback prompt explicit.
+    if image_args and result.returncode != 0 and looks_like_image_input_failure(result.stderr):
+        output_path.unlink(missing_ok=True)
+        images_attached = False
+        evidence_result.detail = (
+            "Codex provider/model rejected image input; review retried without images"
+        )
+        prompt = base_prompt + visual_prompt(evidence_result, False)
+        prompt_path.write_text(prompt, encoding="utf-8")
+        command = [*command_without_images, "-"]
+        result = run_process(
+            command,
+            cwd=repo.canonical_root,
+            input_text=prompt,
+            timeout=getattr(args, "timeout", None),
+        )
     duration_seconds = round(time.monotonic() - started_monotonic, 1)
 
     # Canonical name (under the lock) for the raw NDJSON event stream; the
@@ -1903,6 +2019,8 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 # the staged log and report both the Codex failure and the status
                 # change without touching the run.
                 staged_error.unlink(missing_ok=True)
+                if evidence_result.output_dir is not None:
+                    shutil.rmtree(evidence_result.output_dir, ignore_errors=True)
                 raise WorkflowError(
                     f"Codex {phase} failed ({codex_failure}); the run is no "
                     f"longer active and was left unchanged: {status_exc}"
@@ -1913,6 +2031,8 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 f"Codex {phase} failed; see {make_relative_path(error_path, run_dir)}"
             )
             save_run_state(run_dir, err_state)
+        if evidence_result.output_dir is not None:
+            shutil.rmtree(evidence_result.output_dir, ignore_errors=True)
         raise WorkflowError(codex_failure)
 
     # Any failure after this point (NDJSON staging, parse, schema validation,
@@ -1989,10 +2109,22 @@ def cmd_codex(args: argparse.Namespace) -> int:
             phase_label = phase
             if phase == "review":
                 next_round = int(state.get("review_round", 0)) + 1
-                maximum = int(state.get("max_review_rounds", 3))
+                maximum = effective_review_limit(state)
                 if next_round > maximum:
-                    state["status"] = "blocked"
                     state["phase"] = "review-budget-exhausted"
+                    state["awaiting_human_decision"] = True
+                    state["awaiting_human_decision_reason"] = (
+                        "Review budget exhausted; a human must authorize one additional "
+                        "confirmation review or choose a follow-up continuation."
+                    )
+                    changed = mark_review_evidence_stale_if_changed(repo, state)
+                    state["recovery"] = {
+                        "kind": "review-budget-exhausted",
+                        "work_preserved": True,
+                        "verification_preserved": True,
+                        "recommended_action": "allow-one-more-review",
+                        "changed_since_review": changed,
+                    }
                     state.setdefault("notes", []).append(
                         f"Maximum review rounds exhausted ({maximum})"
                     )
@@ -2049,6 +2181,30 @@ def cmd_codex(args: argparse.Namespace) -> int:
             if events_path != events_canonical and events_path.exists():
                 events_path.replace(events_canonical)
                 events_path = events_canonical
+            evidence_record: dict[str, Any] | None = None
+            if evidence_result.configured:
+                evidence_record = {
+                    "status": evidence_result.status,
+                    "attached_to_codex": images_attached,
+                }
+                if evidence_result.detail:
+                    evidence_record["detail"] = evidence_result.detail
+                if evidence_result.output_dir is not None:
+                    evidence_canonical = run_dir / phase_label / "screenshots"
+                    evidence_canonical.parent.mkdir(parents=True, exist_ok=True)
+                    if evidence_canonical.exists():
+                        raise WorkflowError(
+                            f"UI evidence already exists for {phase_label}; "
+                            "refusing to overwrite it"
+                        )
+                    evidence_result.output_dir.replace(evidence_canonical)
+                    evidence_record["path"] = make_relative_path(
+                        evidence_canonical, run_dir
+                    )
+                    if evidence_result.manifest is not None:
+                        evidence_record["manifest"] = make_relative_path(
+                            evidence_canonical / "manifest.json", run_dir
+                        )
             state.setdefault("artifacts", {})[phase] = make_relative_path(
                 final_path, run_dir
             )
@@ -2064,28 +2220,36 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 checkpoint = capture_review_checkpoint(
                     repo, state, checkpoint_id=phase_label
                 )
-                state.setdefault("reviews", []).append(
-                    {
-                        "round": next_round,
-                        "path": make_relative_path(final_path, run_dir),
-                        "verdict": parsed.get("verdict"),
-                        "delta": is_delta_review,
-                        "checkpoint": checkpoint,
-                    }
-                )
+                review_record: dict[str, Any] = {
+                    "round": next_round,
+                    "path": make_relative_path(final_path, run_dir),
+                    "verdict": parsed.get("verdict"),
+                    "delta": is_delta_review,
+                    "checkpoint": checkpoint,
+                }
+                if evidence_record is not None:
+                    review_record["ui_evidence"] = evidence_record
+                state.setdefault("reviews", []).append(review_record)
                 if is_delta_review:
                     merge_delta_review(state, parsed, next_round)
                 else:
                     merge_full_review(state, parsed, next_round)
                 merge_acceptance_criteria(state, parsed, next_round)
+                state["review_evidence"] = {
+                    "state": "current", "review_round": next_round
+                }
+                state.pop("recovery", None)
             elif phase == "adversarial":
                 state["phase"] = "adversarially-reviewed"
+                adversarial_record: dict[str, Any] = {
+                    "round": index,
+                    "path": make_relative_path(final_path, run_dir),
+                    "verdict": parsed.get("verdict"),
+                }
+                if evidence_record is not None:
+                    adversarial_record["ui_evidence"] = evidence_record
                 state.setdefault("adversarial_reviews", []).append(
-                    {
-                        "round": index,
-                        "path": make_relative_path(final_path, run_dir),
-                        "verdict": parsed.get("verdict"),
-                    }
+                    adversarial_record
                 )
 
             usage_record: dict[str, Any] = {
@@ -2115,6 +2279,8 @@ def cmd_codex(args: argparse.Namespace) -> int:
         if not published:
             for staged in (staged_output, staged_events):
                 staged.unlink(missing_ok=True)
+            if evidence_result.output_dir is not None:
+                shutil.rmtree(evidence_result.output_dir, ignore_errors=True)
     print(final_path)
     return 0
 
@@ -2639,6 +2805,7 @@ def cmd_run_check(args: argparse.Namespace) -> int:
         state["verification"]["passed"] = bool(effective_checks) and all(
             c["exit_code"] == 0 for c in effective_checks
         )
+        mark_review_evidence_stale_if_changed(repo, state)
         state["phase"] = (
             "verified" if state["verification"]["passed"] else "verification-failed"
         )
@@ -2837,6 +3004,345 @@ def cmd_resume(args: argparse.Namespace) -> int:
         state["stop_gate_blocks"] = 0
         save_run_state(run_dir, state)
     print(json.dumps({"awaiting_human_decision": False, "was_awaiting": was_awaiting}))
+    return 0
+
+
+def cmd_authorize_review(args: argparse.Namespace) -> int:
+    """Explicitly grant one additional review to this run without config drift."""
+    repo, state_home, run_id_override = get_context(args)
+    run_ref = resolve_run_for_active_mutation(
+        state_home, repo.id, repo.canonical_root, run_id_override,
+        operation="authorize-review",
+    )
+    with RunStateLock(run_ref.run_dir):
+        state = load_run_state(run_ref.run_dir)
+        verify_loaded_run_identity(
+            state, run_dir=run_ref.run_dir, expected_repo_id=repo.id
+        )
+        require_active_run_state(state, run_ref.run_id, "authorize-review")
+        require_no_unsafe_drift(state, repo)
+        continuation = state.get("continuation", {})
+        is_review_recovery_child = (
+            isinstance(continuation, dict)
+            and continuation.get("intended_recovery_action")
+            == "allow-one-more-review"
+            and isinstance(state.get("parent_run_id"), str)
+        )
+        existing_recovery_grant = next(
+            (
+                grant
+                for grant in state.get("review_round_authorizations", [])
+                if isinstance(grant, dict)
+                and grant.get("recovery_parent_run_id") == state.get("parent_run_id")
+            ),
+            None,
+        )
+        if is_review_recovery_child and existing_recovery_grant is not None:
+            print(json.dumps({
+                "run_id": run_ref.run_id,
+                "original_max_review_rounds": state.get("max_review_rounds", 3),
+                "effective_review_limit": effective_review_limit(state),
+                "authorization": existing_recovery_grant,
+                "reused": True,
+            }))
+            return 0
+        if state.get("phase") != "review-budget-exhausted" and not is_review_recovery_child:
+            raise WorkflowError(
+                "authorize-review is only allowed while the current run is in "
+                "review-budget-exhausted or is a linked continuation carrying "
+                "the allow-one-more-review recovery intent."
+            )
+        grant = {
+            "kind": "additional-review-round",
+            "additional_rounds": 1,
+            "authorized_at": utc_now(),
+            "reason": (args.reason or "Human authorized one confirmation review").strip(),
+            "original_max_review_rounds": int(state.get("max_review_rounds", 3)),
+        }
+        if is_review_recovery_child:
+            grant["recovery_parent_run_id"] = state["parent_run_id"]
+            grant["recovery_intent"] = "allow-one-more-review"
+        state.setdefault("review_round_authorizations", []).append(grant)
+        state.setdefault("human_overrides", []).append(dict(grant))
+        state["awaiting_human_decision"] = False
+        state.pop("awaiting_human_decision_reason", None)
+        state["phase"] = "review-round-authorized"
+        state["stop_gate_blocks"] = 0
+        state.pop("recovery", None)
+        state.setdefault("notes", []).append(
+            "Human authorized one additional review round for this run only"
+        )
+        save_run_state(run_ref.run_dir, state)
+    print(json.dumps({
+        "run_id": run_ref.run_id,
+        "original_max_review_rounds": state.get("max_review_rounds", 3),
+        "effective_review_limit": effective_review_limit(state),
+        "authorization": grant,
+    }))
+    return 0
+
+
+def _copy_continuation_artifact(
+    source_dir: Path,
+    target_dir: Path,
+    relative: object,
+    *,
+    target_relative: str | None = None,
+) -> str | None:
+    if not isinstance(relative, str) or not relative:
+        return None
+    try:
+        source = resolve_artifact_path(relative, source_dir)
+    except StateError:
+        return None
+    if not source.is_file():
+        return None
+    copied_relative = target_relative or relative
+    target = target_dir / copied_relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    return copied_relative
+
+
+def _copy_inherited_review_refs(
+    source_dir: Path,
+    target_dir: Path,
+    parent_run_id: str,
+    refs: object,
+) -> list[dict[str, Any]]:
+    if not isinstance(refs, list):
+        return []
+    copied_refs: list[dict[str, Any]] = []
+    for index, raw_ref in enumerate(refs, start=1):
+        if not isinstance(raw_ref, dict):
+            continue
+        ref = json.loads(json.dumps(raw_ref))
+        source_path = ref.get("path")
+        if isinstance(source_path, str) and source_path:
+            inherited_path = (
+                f"inherited/{parent_run_id}/"
+                f"{index:02d}-{Path(source_path).name}"
+            )
+            copied = _copy_continuation_artifact(
+                source_dir,
+                target_dir,
+                source_path,
+                target_relative=inherited_path,
+            )
+            if copied is not None:
+                ref["path"] = copied
+        ref["inherited_from_run_id"] = parent_run_id
+        copied_refs.append(ref)
+    return copied_refs
+
+
+def cmd_continue_run(args: argparse.Namespace) -> int:
+    """Create a linked follow-up for useful work in a safely immutable blocked run."""
+    repo, state_home, run_id_override = get_context(args)
+    parent = resolve_run_for_transition(
+        state_home, repo.id, repo.canonical_root, run_id_override
+    )
+    if parent.state.get("status") != "blocked":
+        raise WorkflowError(
+            "continue-run is only allowed for blocked runs; cancelled, archived, "
+            "complete, corrupt, and active runs are not continuation sources."
+        )
+    require_no_unsafe_drift(parent.state, repo)
+    intent = args.intent or "continue-blocked"
+    with RepoInitLock(state_home, repo.id):
+        active = find_active_runs(state_home, repo.id)
+        matching = [
+            ref for ref in active
+            if ref.state.get("parent_run_id") == parent.run_id
+        ]
+        if matching:
+            continuation_ref = max(
+                matching,
+                key=lambda ref: str(ref.state.get("created_at", ref.run_id)),
+            )
+            with RunStateLock(continuation_ref.run_dir):
+                child_state = load_run_state(continuation_ref.run_dir)
+                verify_loaded_run_identity(
+                    child_state,
+                    run_dir=continuation_ref.run_dir,
+                    expected_repo_id=repo.id,
+                )
+                require_active_run_state(
+                    child_state, continuation_ref.run_id, "reuse continuation"
+                )
+                require_no_unsafe_drift(child_state, repo)
+                child_changed = False
+                # Continuations created by older controller builds carried the
+                # parent review list only under inherited_reviews, leaving the
+                # canonical reviews list empty. Backfill confined copies into
+                # the child when it is reused so Resume can route from the
+                # preserved passing review to a missing adversarial gate. This
+                # mutates only the active child; the terminal parent is read-only.
+                if (
+                    not child_state.get("reviews")
+                    and parent.state.get("reviews")
+                ):
+                    inherited_reviews = _copy_inherited_review_refs(
+                        parent.run_dir,
+                        continuation_ref.run_dir,
+                        parent.run_id,
+                        parent.state.get("reviews", []),
+                    )
+                    if inherited_reviews:
+                        child_state["reviews"] = inherited_reviews
+                        child_state["inherited_reviews"] = inherited_reviews
+                        latest_path = inherited_reviews[-1].get("path")
+                        if isinstance(latest_path, str):
+                            child_state.setdefault("artifacts", {})["review"] = latest_path
+                        child_changed = True
+                continuation = child_state.setdefault("continuation", {})
+                previous_intent = continuation.get("intended_recovery_action")
+                continuation["intended_recovery_action"] = intent
+                if previous_intent != intent:
+                    continuation.setdefault("intent_history", []).append({
+                        "intent": intent,
+                        "recorded_at": utc_now(),
+                    })
+                    child_state.setdefault("notes", []).append(
+                        f"Continuation recovery intent set to {intent}"
+                    )
+                    child_changed = True
+                if child_changed:
+                    save_run_state(continuation_ref.run_dir, child_state)
+            print(json.dumps({
+                "run_id": continuation_ref.run_id,
+                "parent_run_id": parent.run_id,
+                "run_dir": str(continuation_ref.run_dir),
+                "intent": intent,
+                "reused": True,
+            }))
+            return 0
+        if active:
+            raise WorkflowError(
+                "Cannot create a continuation while another run is active: "
+                + ", ".join(r.run_id for r in active)
+            )
+        run_id = new_run_id()
+        run_dir = run_dir_path(state_home, repo.id, run_id)
+        with RunStateLock(run_dir):
+            parent_state = load_run_state(parent.run_dir)
+            verify_loaded_run_identity(
+                parent_state, run_dir=parent.run_dir, expected_repo_id=repo.id
+            )
+            if parent_state.get("status") != "blocked":
+                raise WorkflowError("Parent run changed state; retry continuation.")
+
+            artifacts: dict[str, str] = {}
+            for key, rel in parent_state.get("artifacts", {}).items():
+                if key in {"review", "adversarial"}:
+                    continue
+                copied = _copy_continuation_artifact(parent.run_dir, run_dir, rel)
+                if copied is not None:
+                    artifacts[key] = copied
+            # Legacy runs may have conventional accepted artifacts without
+            # explicit pointers. Preserve them too so continuation never drops
+            # already-accepted specification or plan work.
+            for key, filename in (
+                ("accepted_spec", "accepted-spec.md"),
+                ("accepted_plan", "accepted-plan.md"),
+            ):
+                if key not in artifacts:
+                    copied = _copy_continuation_artifact(
+                        parent.run_dir, run_dir, filename
+                    )
+                    if copied is not None:
+                        artifacts[key] = copied
+            verification = json.loads(json.dumps(parent_state.get("verification", {"checks": []})))
+            for check in verification.get("checks", []):
+                if isinstance(check, dict):
+                    _copy_continuation_artifact(parent.run_dir, run_dir, check.get("log"))
+            inherited_reviews = _copy_inherited_review_refs(
+                parent.run_dir,
+                run_dir,
+                parent.run_id,
+                parent_state.get("reviews", []),
+            )
+            inherited_adversarial = _copy_inherited_review_refs(
+                parent.run_dir,
+                run_dir,
+                parent.run_id,
+                parent_state.get("adversarial_reviews", []),
+            )
+            if inherited_reviews and isinstance(inherited_reviews[-1].get("path"), str):
+                artifacts["review"] = inherited_reviews[-1]["path"]
+
+            state = {
+                "schema_version": 2,
+                "run_id": run_id,
+                "label": args.label or f"Continuation of {parent.run_id}",
+                "feature": parent_state.get("feature", ""),
+                "status": "active",
+                "phase": "continuation-ready",
+                "created_at": utc_now(),
+                "repository": repository_state_block(
+                    repo,
+                    worktree_mode=(parent_state.get("repository") or {}).get("worktree_mode"),
+                ),
+                "baseline": {
+                    "commit": repo.head_commit,
+                    "branch": repo.branch,
+                    "worktree_path": str(repo.worktree_path),
+                    "dirty_entries_at_init": git(
+                        repo.canonical_root, "status", "--porcelain", check=False
+                    ).splitlines(),
+                },
+                "parent_run_id": parent.run_id,
+                "continuation": {
+                    "parent_run_id": parent.run_id,
+                    "reason_previous_run_stopped": parent_state.get("blocking_reason")
+                    or parent_state.get("phase", "blocked"),
+                    "created_at": utc_now(),
+                    "same_repository": True,
+                    "same_branch": repo.branch == (parent_state.get("baseline") or {}).get("branch"),
+                    "work_preserved": True,
+                    "verification_preserved": True,
+                    "intended_recovery_action": intent,
+                    "intent_history": [{"intent": intent, "recorded_at": utc_now()}],
+                },
+                "requested_mode": parent_state.get("requested_mode"),
+                "effective_mode": parent_state.get("effective_mode"),
+                "mode_origin": "continuation",
+                "mode_reasons": list(parent_state.get("mode_reasons", [])),
+                "max_review_rounds": int(parent_state.get("max_review_rounds", 3)),
+                "review_round": 0,
+                "stop_gate_blocks": 0,
+                "awaiting_human_decision": False,
+                "artifacts": artifacts,
+                "verification": verification,
+                "reviews": inherited_reviews,
+                "inherited_reviews": inherited_reviews,
+                "adversarial_reviews": [],
+                "inherited_adversarial_reviews": inherited_adversarial,
+                "cumulative_findings": json.loads(json.dumps(parent_state.get("cumulative_findings", []))),
+                "cumulative_acceptance_criteria": json.loads(json.dumps(parent_state.get("cumulative_acceptance_criteria", []))),
+                "review_ledger": json.loads(json.dumps(parent_state.get("review_ledger", []))),
+                "codex_runs": [],
+                "risk": json.loads(json.dumps(parent_state.get("risk", {}))),
+                "review_evidence": {"state": "current", "source_run_id": parent.run_id},
+                "notes": [
+                    f"Continuation of blocked run {parent.run_id}; accepted artifacts, "
+                    "verification, unresolved findings, and acceptance evidence carried forward."
+                ],
+            }
+            mark_review_evidence_stale_if_changed(repo, state)
+            if "config_snapshot" in parent_state:
+                state["config_snapshot"] = json.loads(json.dumps(parent_state["config_snapshot"]))
+            save_run_state(run_dir, state)
+        meta = load_repo_metadata(state_home, repo.id)
+        meta["last_run_id"] = run_id
+        save_repo_metadata(state_home, repo.id, meta)
+    print(json.dumps({
+        "run_id": run_id,
+        "parent_run_id": parent.run_id,
+        "run_dir": str(run_dir),
+        "intent": intent,
+        "reused": False,
+    }))
     return 0
 
 
@@ -3064,11 +3570,23 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"Worktree mode: {worktree_mode_label(worktree_mode)}")
     print(f"Baseline: {state.get('baseline', {}).get('commit')}")
     print(f"Verification: {passed}/{len(checks)} passing")
-    print(
-        f"Reviews: {state.get('review_round', 0)}/{state.get('max_review_rounds', 3)}"
-    )
+    original_limit = int(state.get("max_review_rounds", 3))
+    effective_limit = effective_review_limit(state)
+    review_budget = f"{state.get('review_round', 0)}/{original_limit}"
+    if effective_limit != original_limit:
+        review_budget += f" (+{effective_limit - original_limit} explicitly authorized)"
+    print(f"Reviews: {review_budget}")
     if state.get("reviews"):
         print(f"Latest review: {state['reviews'][-1].get('verdict')}")
+        ui_evidence = state["reviews"][-1].get("ui_evidence")
+        if isinstance(ui_evidence, dict):
+            attachment = (
+                "attached" if ui_evidence.get("attached_to_codex") else "not attached"
+            )
+            print(
+                f"Latest review UI evidence: {ui_evidence.get('status')} "
+                f"({attachment})"
+            )
     if state.get("risk", {}).get("requires_adversarial_review"):
         verdict = (
             state.get("adversarial_reviews", [{}])[-1].get("verdict")
@@ -3076,6 +3594,18 @@ def cmd_status(args: argparse.Namespace) -> int:
             else "missing"
         )
         print(f"Adversarial review required: {verdict}")
+        if state.get("adversarial_reviews"):
+            ui_evidence = state["adversarial_reviews"][-1].get("ui_evidence")
+            if isinstance(ui_evidence, dict):
+                attachment = (
+                    "attached"
+                    if ui_evidence.get("attached_to_codex")
+                    else "not attached"
+                )
+                print(
+                    f"Latest adversarial UI evidence: {ui_evidence.get('status')} "
+                    f"({attachment})"
+                )
     failures = state.get("completion_gate_failures", [])
     if failures:
         print("Remaining gates:")
@@ -3127,6 +3657,7 @@ def cmd_block(args: argparse.Namespace) -> int:
         require_no_unsafe_drift(state, repo)
         state["status"] = "blocked"
         state["phase"] = "blocked"
+        state["blocking_reason"] = args.reason
         state.setdefault("notes", []).append(args.reason)
         save_run_state(run_dir, state)
     print("Workflow blocked")
@@ -3536,12 +4067,54 @@ def compute_next_action(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
         except StateError:
             return (run_dir / fname).exists()
 
-    if status in {"complete", "blocked", "cancelled", "archived"}:
+    if status in {"complete", "cancelled", "archived"}:
         return {
             "phase": status,
             "required_action": f"Run is {status}; no further action.",
             "completion_condition": "n/a",
             "references": [],
+        }
+
+    if status == "blocked":
+        adversarial = state.get("adversarial_reviews", [])
+        if (
+            state.get("risk", {}).get("requires_adversarial_review")
+            and (not adversarial or adversarial[-1].get("verdict") != "pass")
+        ):
+            recommendation = (
+                "Continue blocked work in a linked follow-up run, then resume the "
+                "missing adversarial review."
+            )
+        elif cumulative_unresolved_severe(state) or blocking_acceptance_criteria(state):
+            recommendation = (
+                "Continue unresolved findings and acceptance criteria in a linked "
+                "follow-up run; preserved review evidence needs reassessment after fixes."
+            )
+        else:
+            recommendation = (
+                "Continue the preserved work in a linked follow-up run, or archive it."
+            )
+        return {
+            "phase": "blocked-continuation",
+            "required_action": recommendation,
+            "completion_condition": "Required gates are re-evaluated and pass in the follow-up run.",
+            "references": [_reference("review.md")],
+            "available_actions": ["continue-run", "archive-run"],
+        }
+
+    if state.get("phase") == "review-budget-exhausted":
+        return {
+            "phase": "review-budget-exhausted",
+            "required_action": (
+                "Work and verification are preserved. A human may explicitly allow one "
+                "additional confirmation review with `authorize-review`, or cancel/block "
+                "and create a linked continuation."
+            ),
+            "completion_condition": (
+                "An authorized review reassesses stale evidence and all required gates pass."
+            ),
+            "references": [_reference("review.md")],
+            "available_actions": ["authorize-review", "cancel"],
         }
 
     # A genuine human decision pause is not a terminal state, but the workflow
@@ -3996,6 +4569,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional note recorded when resuming (e.g., 'user chose option A').",
     )
     resume.set_defaults(func=cmd_resume)
+
+    authorize_review = sub.add_parser(
+        "authorize-review",
+        help="Explicitly allow one additional review round for this run only.",
+    )
+    authorize_review.add_argument(
+        "--reason", help="Optional audit reason for the human authorization."
+    )
+    authorize_review.set_defaults(func=cmd_authorize_review)
+
+    continue_run = sub.add_parser(
+        "continue-run",
+        help="Create a linked follow-up run from preserved blocked work.",
+    )
+    continue_run.add_argument("--label", help="Optional label for the continuation.")
+    continue_run.add_argument(
+        "--intent",
+        choices=("allow-one-more-review", "resume-adversarial", "continue-blocked"),
+        default="continue-blocked",
+        help="Recovery action the linked continuation should perform next.",
+    )
+    continue_run.set_defaults(func=cmd_continue_run)
 
     evaluate = sub.add_parser("evaluate", help="Evaluate all completion gates")
     evaluate.set_defaults(func=cmd_evaluate)

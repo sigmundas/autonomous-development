@@ -86,7 +86,9 @@ submitting this skill invocation as the first prompt.
    After satisfying a phase completion condition, call explicit-run `next-action --json` again.
 
 3. Respect human decisions. If status or next-action reports an existing human-decision pause,
-   surface the recorded decision and stop. After the user supplies the decision in this session,
+   surface the recorded decision and stop. A `review-budget-exhausted` pause specifically requires
+   the human to invoke/approve `authorize-review`; do not clear it with generic `resume` and do not
+   imply the last `changes_required` review passed. After the user supplies any other decision,
    record it on the same run and continue:
 
    ```bash
@@ -96,6 +98,12 @@ submitting this skill invocation as the first prompt.
 
    Use `await-decision` only for a concrete choice, user-only authorization, or missing fact that
    cannot be safely inferred. Apply the same restrictions documented by the Start workflows.
+
+   A terminal `blocked` run remains immutable. If the user chooses **Continue blocked run**, use
+   `continue-run --intent <allow-one-more-review|resume-adversarial|continue-blocked>` on that exact
+   parent id; continue only in the linked child run returned by the controller. Reuse an existing
+   active child returned by the controller rather than creating another. Cancelled, archived, and
+   complete runs are not continuation sources.
 
 4. When next-action reports `phase: evaluate`, finish through the same gates and report from the
    same run:

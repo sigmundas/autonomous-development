@@ -28,8 +28,11 @@ controller.py triage --file <triage.json>
 
 Also write a human-readable `triage-NN.md` with repository evidence for every rejection. Fix
 accepted findings, add regression tests, rerun affected checks, and request a fresh review. Stop and
-mark the run blocked if the same critical/high issue recurs after a genuine fix attempt or the
-review budget is exhausted.
+mark the run blocked if the same critical/high issue recurs after a genuine fix attempt. If the
+review budget is exhausted, preserve the active run in its `review-budget-exhausted` human-decision
+state. Do not convert `changes_required` to pass or silently extend the budget. A human may grant
+exactly one run-local confirmation round with `controller.py authorize-review`; the controller
+records the override without changing `max_review_rounds` or global configuration.
 
 ## Adversarial review (high-risk gate)
 

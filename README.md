@@ -183,6 +183,14 @@ A run may pause when it genuinely requires a human decision it cannot safely
 infer on its own. After you supply the decision, the run can continue from
 where it paused.
 
+Review-budget exhaustion is one such recoverable pause. The original snapshotted limit remains
+unchanged; an explicit `controller.py authorize-review` records a run-local +1 confirmation round.
+Blocked runs remain immutable, but `controller.py continue-run` can create a linked follow-up on
+the same checkout with accepted artifacts, verification, unresolved findings, and acceptance
+evidence carried forward. `continue-run --intent ...` records the requested recovery action and
+reuses a suitable active continuation on repeated requests. The VS Code recovery actions select
+that exact child and automatically start/focus Claude with the Resume workflow.
+
 ## Adaptive workflow modes
 
 `init` accepts `--mode` to scale workflow depth to the change:
@@ -455,7 +463,10 @@ A run succeeds only when:
 - no unresolved `critical` or `high` findings remain;
 - an adversarial review passes when the change is classified as high risk.
 
-A run stops as `blocked` when credentials or required services are unavailable, requirements materially conflict, verification cannot be performed, or the maximum review/fix rounds are exhausted.
+A run stops as `blocked` when credentials or required services are unavailable, requirements
+materially conflict, verification cannot be performed, or genuine autonomous retry attempts are
+exhausted. Review-round exhaustion instead pauses in recoverable `review-budget-exhausted` state
+until a human explicitly authorizes one additional review or chooses another terminal action.
 
 ## Security boundaries
 
@@ -478,6 +489,8 @@ By default, run autonomous development in an isolated worktree. This fork also s
 - Change `max_review_rounds` through the controller's `init --max-review-rounds` option.
 - Map workflow phases to locally available Codex models and reasoning settings with
   `CLAUDE_AUTONOMOUS_PHASE_PROFILES` (JSON) and `CLAUDE_AUTONOMOUS_CODEX_MODEL_<PHASE>`.
+- Optionally configure a deterministic repository-owned screenshot renderer as
+  described in [`docs/ui-review-evidence.md`](docs/ui-review-evidence.md).
 
 ## Compatibility note
 

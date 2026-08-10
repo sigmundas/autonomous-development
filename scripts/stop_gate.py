@@ -86,10 +86,22 @@ def _block_and_exit(run_dir: Path) -> int:
             require_active_run_state(state, str(state.get("run_id", "")), "block")
         except StateError:
             return 0
+        # Re-check the human hold under the mutation lock. The pre-lock check in
+        # main is advisory only; an await-decision or review-budget hold may be
+        # recorded between discovery and this write and must never spend retry
+        # budget because a generic Stop hook happened to race it.
+        if (
+            state.get("awaiting_human_decision") is True
+            or state.get("phase") == "review-budget-exhausted"
+        ):
+            return 0
         blocks = int(state.get("stop_gate_blocks", 0))
         if blocks >= MAX_GATE_BLOCKS:
             state["status"] = "blocked"
             state["phase"] = "stop-gate-budget-exhausted"
+            state["blocking_reason"] = (
+                "The bounded autonomous Stop-hook retry budget was exhausted."
+            )
             state.setdefault("notes", []).append(
                 "The bounded Stop hook retry budget was exhausted; inspect manually."
             )
