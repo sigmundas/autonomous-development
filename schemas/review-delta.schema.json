@@ -9,8 +9,8 @@
     "summary": {"type": "string"},
     "resolved_findings": {
       "type": "array",
-      "uniqueItems": true,
-      "items": {"type": "string", "pattern": "^F-[0-9]+$"}
+      "items": {"type": "string", "pattern": "^F-[0-9]+$"},
+      "$comment": "TEMPORARY: 'uniqueItems: true' removed to satisfy OpenAI structured-output response_format API (rejects uniqueItems as of 2026-08). Restore or replace with alternative uniqueness enforcement once the API supports it or a client-side validator layer is added."
     },
     "new_findings": {
       "type": "array",
