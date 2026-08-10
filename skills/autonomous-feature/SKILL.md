@@ -14,9 +14,14 @@ allowed-tools:
   - Agent
   - EnterWorktree
   - ExitWorktree
-  - Bash(git *)
-  - Bash(python3 *)
-  - Bash(codex *)
+  - Bash(git status:*)
+  - Bash(git diff:*)
+  - Bash(git log:*)
+  - Bash(git show:*)
+  - Bash(git rev-parse:*)
+  - Bash(git ls-files:*)
+  - Bash(python3:*)
+  - Bash(codex:*)
 disallowed-tools:
   - AskUserQuestion
 hooks:

@@ -137,6 +137,8 @@ launcher = "/Users/example/bin/claude-anthropic"
 [claude_runtimes.azure-claude]
 display_name = "Azure · Claude"
 launcher = "/Users/example/bin/claude-azure"
+allowed_commands = ["ruff", "npm run test"]
+executable_paths = ["/opt/homebrew/bin", "~/.local/bin"]
 
 [claude_models.sonnet]
 display_name = "Sonnet"
@@ -171,6 +173,11 @@ Constraints enforced at validation time:
 - `workflow_mode` must be one of `auto | lean | standard | rigorous`.
 - `active_preset`, when set, must name a defined preset.
 - A preset's `claude_runtime`, when set, must name a defined runtime.
+- Runtime `allowed_commands` entries are simple executable/subcommand prefixes.
+  Shell syntax, shell launchers, and destructive or unbounded Git commands are rejected.
+- Runtime `executable_paths` entries are prepended to the inherited Claude/controller
+  PATH. They provide predictable direct executable lookup without a login-shell wrapper.
+  The VS Code launcher also prepends the directory containing an absolute Claude launcher.
 - A preset's optional `claude_model` must name a defined model. Omitting it is
   the Default selection and does not pass `--model` to Claude Code.
 - Claude model definitions are user-extensible; no provider catalog is
@@ -298,6 +305,8 @@ other secrets, even if the source profile file contains them: only `id`,
       "display_name": "Azure · Claude",
       "launcher": "/Users/…/bin/claude-azure",
       "args": [],
+      "allowed_commands": ["ruff"],
+      "executable_paths": ["/opt/homebrew/bin"],
       "launcher_exists": true,
       "launcher_executable": true
     }

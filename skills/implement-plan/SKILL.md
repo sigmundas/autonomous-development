@@ -3,7 +3,7 @@ name: implement-plan
 description: Implement the currently accepted autonomous-development plan with tests and documentation while preserving unrelated changes and safety boundaries.
 disable-model-invocation: true
 effort: max
-allowed-tools: Read Grep Glob Edit Write LSP Agent Bash(git *) Bash(python3 *)
+allowed-tools: Read Grep Glob Edit Write LSP Agent Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git rev-parse:*) Bash(git ls-files:*) Bash(python3:*)
 disallowed-tools: AskUserQuestion
 ---
 

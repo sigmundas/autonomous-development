@@ -3,7 +3,7 @@ name: adversarial-review
 description: Run a fresh read-only Codex challenge review for authentication, authorization, persistence, migration, concurrency, retry, data-loss, privacy, or external-service risks.
 disable-model-invocation: true
 effort: max
-allowed-tools: Read Grep Glob Bash(git *) Bash(python3 *) Bash(codex *)
+allowed-tools: Read Grep Glob Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git rev-parse:*) Bash(git ls-files:*) Bash(python3:*) Bash(codex:*)
 disallowed-tools: AskUserQuestion Edit Write
 ---
 

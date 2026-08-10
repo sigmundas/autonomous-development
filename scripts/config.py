@@ -358,7 +358,7 @@ def _validate_phase(
 def _validate_claude_runtime(
     name: str, runtime: dict[str, Any], warnings: list[str]
 ) -> None:
-    known = {"display_name", "launcher", "args"}
+    known = {"display_name", "launcher", "args", "allowed_commands", "executable_paths"}
     for key in runtime:
         if key not in known:
             warnings.append(
@@ -380,6 +380,47 @@ def _validate_claude_runtime(
     ):
         raise ConfigError(
             f"claude_runtimes.{name}.args must be an array of strings."
+        )
+    allowed_commands = runtime.get("allowed_commands", [])
+    if not isinstance(allowed_commands, list) or any(
+        not isinstance(command, str) for command in allowed_commands
+    ):
+        raise ConfigError(
+            f"claude_runtimes.{name}.allowed_commands must be an array of strings."
+        )
+    for command in allowed_commands:
+        _validate_allowed_command(name, command)
+    executable_paths = runtime.get("executable_paths", [])
+    if not isinstance(executable_paths, list) or any(
+        not isinstance(path, str) or not path for path in executable_paths
+    ):
+        raise ConfigError(
+            f"claude_runtimes.{name}.executable_paths must be an array of non-empty strings."
+        )
+
+
+_SAFE_COMMAND = re.compile(r"^[A-Za-z0-9_./+@-]+(?: [A-Za-z0-9_./+@:-]+){0,2}$")
+_SHELL_COMMANDS = {"bash", "sh", "zsh", "fish", "cmd", "cmd.exe", "powershell", "pwsh"}
+_SAFE_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files"}
+
+
+def _validate_allowed_command(runtime_name: str, command: str) -> None:
+    """Validate a Claude Bash permission prefix without accepting shell syntax."""
+    if not _SAFE_COMMAND.fullmatch(command):
+        raise ConfigError(
+            f"claude_runtimes.{runtime_name}.allowed_commands contains unsafe command "
+            f"prefix {command!r}; use a simple executable or subcommand without shell operators."
+        )
+    parts = command.split()
+    executable = Path(parts[0]).name.lower()
+    if executable in _SHELL_COMMANDS:
+        raise ConfigError(
+            f"claude_runtimes.{runtime_name}.allowed_commands cannot grant a shell: {command!r}."
+        )
+    if executable == "git" and (len(parts) < 2 or parts[1] not in _SAFE_GIT_SUBCOMMANDS):
+        raise ConfigError(
+            f"claude_runtimes.{runtime_name}.allowed_commands cannot grant destructive or "
+            f"unbounded Git command {command!r}."
         )
 
 

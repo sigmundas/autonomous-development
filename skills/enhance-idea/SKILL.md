@@ -3,7 +3,7 @@ name: enhance-idea
 description: Use a fresh read-only Codex execution to turn a rough feature idea into a structured repository-grounded specification with requirements, acceptance criteria, assumptions, risks, and non-goals.
 argument-hint: "[feature idea]"
 disable-model-invocation: true
-allowed-tools: Read Grep Glob Bash(git *) Bash(python3 *) Bash(codex *)
+allowed-tools: Read Grep Glob Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git rev-parse:*) Bash(git ls-files:*) Bash(python3:*) Bash(codex:*)
 disallowed-tools: AskUserQuestion
 ---
 

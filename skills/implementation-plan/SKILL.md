@@ -3,7 +3,7 @@ name: implementation-plan
 description: Ask a fresh read-only Codex execution for a detailed repository-grounded implementation plan after Claude has accepted the feature specification.
 argument-hint: "[optional planning emphasis]"
 disable-model-invocation: true
-allowed-tools: Read Grep Glob Write Bash(git *) Bash(python3 *) Bash(codex *)
+allowed-tools: Read Grep Glob Write Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git rev-parse:*) Bash(git ls-files:*) Bash(python3:*) Bash(codex:*)
 disallowed-tools: AskUserQuestion
 ---
 

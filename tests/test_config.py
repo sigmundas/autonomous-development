@@ -151,6 +151,19 @@ class LoadValidateTests(_TempMixin):
         with self.assertRaises(user_config.ConfigError):
             user_config.validate_config(cfg)
 
+    def test_runtime_accepts_safe_custom_command_and_rejects_shell_or_dangerous_git(self) -> None:
+        cfg = user_config.default_config()
+        cfg["claude_runtimes"]["local"] = {
+            "launcher": "/usr/bin/claude",
+            "allowed_commands": ["ruff", "npm run test"],
+            "executable_paths": ["/opt/homebrew/bin"],
+        }
+        self.assertEqual(user_config.validate_config(cfg), [])
+        for unsafe in ("uv && rm -rf .", "bash", "git reset --hard", "git push"):
+            cfg["claude_runtimes"]["local"]["allowed_commands"] = [unsafe]
+            with self.assertRaises(user_config.ConfigError):
+                user_config.validate_config(cfg)
+
     def test_unknown_top_level_key_is_warning_not_error(self) -> None:
         cfg = user_config.default_config()
         cfg["mystery"] = 1

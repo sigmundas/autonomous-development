@@ -2,7 +2,7 @@
 name: verify-feature
 description: Discover repository-specific verification commands, run them, record evidence, and diagnose failures for an autonomous-development run.
 disable-model-invocation: true
-allowed-tools: Read Grep Glob LSP Bash(*) Bash(python3 *)
+allowed-tools: Read Grep Glob LSP Bash(python3:*)
 disallowed-tools: AskUserQuestion
 ---
 
@@ -12,6 +12,7 @@ Read [references/check-discovery.md](references/check-discovery.md).
 
 1. Discover authoritative commands from repository instructions and CI configuration.
 2. Run focused tests for changed behavior first.
+   Use one simple command per tool call; do not join unrelated checks with shell operators.
 3. Run applicable formatting checks, linters, type checks, unit tests, integration tests, builds, and runtime verification.
 4. Record each command through:
 

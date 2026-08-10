@@ -58,7 +58,11 @@ class ControllerTests(unittest.TestCase):
         return d
 
     def run_controller(
-        self, repo: Path, *args: str, state_home: Path | None = None
+        self,
+        repo: Path,
+        *args: str,
+        state_home: Path | None = None,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         cmd = ["python3", str(CONTROLLER), "--project-root", str(repo)]
         if state_home is not None:
@@ -69,6 +73,7 @@ class ControllerTests(unittest.TestCase):
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
 
     def _find_state_path(self, repo: Path, state_home: Path) -> Path:
@@ -351,6 +356,55 @@ class ControllerTests(unittest.TestCase):
         state_path = self._find_state_path(repo, state_home)
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertTrue(state["verification"]["passed"])
+
+    def test_run_check_resolves_executable_from_controller_path(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.assertEqual(
+            self.run_controller(
+                repo, "init", "--feature", "Feature", state_home=state_home
+            ).returncode,
+            0,
+        )
+        with tempfile.TemporaryDirectory() as raw_tool_dir:
+            tool_dir = Path(raw_tool_dir)
+            tool = tool_dir / ("autodev-tool.cmd" if os.name == "nt" else "autodev-tool")
+            if os.name == "nt":
+                tool.write_text("@echo ok\r\n", encoding="utf-8")
+            else:
+                tool.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+                tool.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": str(tool_dir) + os.pathsep + os.environ.get("PATH", ""),
+            }
+            result = self.run_controller(
+                repo,
+                "run-check",
+                "--name",
+                "custom-tool",
+                "--",
+                tool.stem if os.name == "nt" else tool.name,
+                state_home=state_home,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0)
+            state = json.loads(self._find_state_path(repo, state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["verification"]["checks"][-1]["exit_code"], 0)
+
+    def test_missing_executable_diagnostic_is_actionable_and_bounded(self) -> None:
+        secret = "AUTODEV_TEST_SECRET_DO_NOT_PRINT"
+        with tempfile.TemporaryDirectory() as raw_dir:
+            directory = Path(raw_dir)
+            env = {"PATH": str(directory), "TOKEN": secret}
+            with self.assertRaises(controller.WorkflowError) as ctx:
+                controller.run_process(
+                    ["definitely-not-an-autodev-tool"], cwd=directory, env=env
+                )
+            message = str(ctx.exception)
+            self.assertIn("Controller PATH searched", message)
+            self.assertIn("executable_paths", message)
+            self.assertNotIn(secret, message)
 
     def test_rerun_supersedes_failed_check(self) -> None:
         repo = self.make_repo()

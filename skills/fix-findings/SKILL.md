@@ -3,7 +3,7 @@ name: fix-findings
 description: Triage the latest Codex review findings, fix evidence-backed issues, add regression tests, rerun verification, and prepare the implementation for a fresh independent review.
 disable-model-invocation: true
 effort: max
-allowed-tools: Read Grep Glob Edit Write LSP Bash(git *) Bash(python3 *)
+allowed-tools: Read Grep Glob Edit Write LSP Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git rev-parse:*) Bash(git ls-files:*) Bash(python3:*)
 disallowed-tools: AskUserQuestion
 ---
 

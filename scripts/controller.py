@@ -229,6 +229,7 @@ def run_process(
     input_text: str | None = None,
     check: bool = False,
     timeout: float | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     effective_timeout = timeout if timeout is not None else _resolve_process_timeout()
     try:
@@ -241,9 +242,10 @@ def run_process(
             stderr=subprocess.PIPE,
             check=check,
             timeout=effective_timeout,
+            env=env,
         )
     except FileNotFoundError as exc:
-        raise WorkflowError(f"Required executable not found: {args[0]}") from exc
+        raise WorkflowError(_missing_executable_diagnostic(args[0], env)) from exc
     except subprocess.TimeoutExpired as exc:
         # subprocess.run terminates the child before raising. Surface the timeout
         # as a non-zero result (fail closed) with whatever partial output exists,
@@ -263,6 +265,46 @@ def run_process(
         return subprocess.CompletedProcess(
             args, PROCESS_TIMEOUT_EXIT_CODE, stdout, stderr + marker
         )
+
+
+def _missing_executable_diagnostic(
+    executable: str, env: dict[str, str] | None = None
+) -> str:
+    """Explain command lookup failure without exposing unrelated environment data."""
+    effective_env = os.environ if env is None else env
+    raw_path = effective_env.get("PATH", "")
+    search_dirs = [entry for entry in raw_path.split(os.pathsep) if entry]
+    home = str(Path.home())
+
+    def display(path: str) -> str:
+        return "~" + path[len(home) :] if path == home or path.startswith(home + os.sep) else path
+
+    searched = os.pathsep.join(display(path) for path in search_dirs) or "<empty>"
+    candidates = [
+        Path.home() / ".local" / "bin" / executable,
+        Path("/opt/homebrew/bin") / executable,
+        Path("/usr/local/bin") / executable,
+    ]
+    outside = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.is_file()
+            and os.access(candidate, os.X_OK)
+            and str(candidate.parent) not in search_dirs
+        ),
+        None,
+    )
+    hint = (
+        f" Found an executable outside PATH at {display(str(outside))}; add its directory "
+        "to the selected Claude runtime's executable_paths."
+        if outside is not None
+        else " Install it or add its directory to the selected Claude runtime's executable_paths."
+    )
+    return (
+        f"Required executable not found: {executable}. "
+        f"Controller PATH searched: {searched}.{hint}"
+    )
 
 
 def git(root: Path, *args: str, check: bool = True) -> str:
@@ -5046,6 +5088,8 @@ def cmd_config_list_claude_runtimes(args: argparse.Namespace) -> int:
                 "display_name": rt.get("display_name"),
                 "launcher": launcher,
                 "args": list(rt.get("args") or []),
+                "allowed_commands": list(rt.get("allowed_commands") or []),
+                "executable_paths": list(rt.get("executable_paths") or []),
                 "launcher_exists": exists,
                 "launcher_executable": executable,
             }

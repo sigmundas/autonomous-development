@@ -2,7 +2,7 @@
 name: autonomous-status
 description: Show the current autonomous-development run, generated artifacts, review budget, verification results, and remaining completion gates.
 disable-model-invocation: true
-allowed-tools: Read Bash(python3 *)
+allowed-tools: Read Bash(python3:*)
 disallowed-tools: AskUserQuestion Edit Write
 ---
 
