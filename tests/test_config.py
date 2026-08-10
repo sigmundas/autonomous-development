@@ -376,6 +376,57 @@ class ConfigCliTests(_TempMixin):
         self.assertFalse(payload["config_exists"])
         self.assertIsNone(payload["active_preset"])
 
+    def test_global_config_commands_work_outside_git(self) -> None:
+        non_repo = self.make_tmp()
+        non_repo.mkdir(parents=True, exist_ok=True)
+        state_home = self.make_tmp()
+        state_home.mkdir(parents=True, exist_ok=True)
+        codex = self._codex_home_with(["outside-git"])
+        (state_home / "config.toml").write_text(
+            '[claude_runtimes.local]\nlauncher = "/bin/sh"\n\n'
+            '[presets.global]\nworkflow_mode = "standard"\n'
+        )
+
+        for command in (
+            ("config-show",),
+            ("config-list-presets",),
+            ("config-list-profiles",),
+            ("config-list-claude-runtimes",),
+            ("config-validate",),
+            ("config-set-active-preset", "global"),
+            ("config-set-claude-runtime", "local"),
+            (
+                "config-set-phase",
+                "--preset",
+                "global",
+                "--phase",
+                "plan",
+                "--profile",
+                "outside-git",
+            ),
+        ):
+            result = self._controller(
+                non_repo, state_home, *command, codex_home=codex
+            )
+            self.assertEqual(result.returncode, 0, (command, result.stderr))
+
+        profiles = json.loads(
+            self._controller(
+                non_repo,
+                state_home,
+                "config-list-profiles",
+                codex_home=codex,
+            ).stdout
+        )
+        self.assertIn("outside-git", {p["id"] for p in profiles["profiles"]})
+
+    def test_run_command_still_rejects_non_git_project_root(self) -> None:
+        non_repo = self.make_tmp()
+        non_repo.mkdir(parents=True, exist_ok=True)
+        result = self._controller(non_repo, self.make_tmp(), "list-runs")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("git repository", result.stderr.lower())
+
     def test_config_set_active_preset_then_show(self) -> None:
         repo = self.make_repo()
         state_home = self.make_tmp()

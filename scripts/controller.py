@@ -308,6 +308,11 @@ def get_context(args: argparse.Namespace) -> tuple[RepoInfo, Path, str | None]:
     return repo, state_home, run_id
 
 
+def get_global_context(args: argparse.Namespace) -> Path:
+    """Return the global state home without resolving repository identity."""
+    return resolve_state_home(getattr(args, "state_dir", None))
+
+
 def require_no_unsafe_drift(state: dict, repo: RepoInfo) -> None:
     """Raise WorkflowError if unsafe drift detected. Expected drift is allowed."""
     drift = detect_drift(state, repo)
@@ -4886,7 +4891,7 @@ def _print_json(payload: Any) -> None:
 def _load_config_for_cmd(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], Path]:
-    _, state_home, _ = get_context(args)
+    state_home = get_global_context(args)
     path = _resolve_config_path(args, state_home)
     try:
         return user_config.load_config(path), path
@@ -4922,7 +4927,7 @@ def cmd_config_show(args: argparse.Namespace) -> int:
 
 
 def cmd_config_validate(args: argparse.Namespace) -> int:
-    _, state_home, _ = get_context(args)
+    state_home = get_global_context(args)
     path = _resolve_config_path(args, state_home)
     try:
         config = user_config.load_config(path)
