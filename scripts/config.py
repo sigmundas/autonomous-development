@@ -161,6 +161,7 @@ def default_config() -> dict[str, Any]:
         },
         "presets": {},
         "claude_runtimes": {},
+        "claude_models": {},
     }
 
 
@@ -191,7 +192,14 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
     _reject_secrets(config, context="validate")
 
-    known_top = {"version", "active_preset", "workflow", "presets", "claude_runtimes"}
+    known_top = {
+        "version",
+        "active_preset",
+        "workflow",
+        "presets",
+        "claude_runtimes",
+        "claude_models",
+    }
     for key in config:
         if key not in known_top:
             warnings.append(f"Unknown top-level key ignored: {key!r}")
@@ -241,6 +249,23 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             raise ConfigError(f"claude_runtimes.{name} must be a table.")
         _validate_claude_runtime(name, runtime, warnings)
 
+    models = config.get("claude_models", {})
+    if not isinstance(models, dict):
+        raise ConfigError("`claude_models` must be a table.")
+    for name, model in models.items():
+        _validate_runtime_name(name)
+        if not isinstance(model, dict):
+            raise ConfigError(f"claude_models.{name} must be a table.")
+        _validate_claude_model(name, model, warnings)
+
+    for name, preset in presets.items():
+        model_ref = preset.get("claude_model")
+        if model_ref is not None and model_ref not in models:
+            raise ConfigError(
+                f"presets.{name}.claude_model {model_ref!r} does not name a "
+                "defined Claude model."
+            )
+
     active_preset = config.get("active_preset")
     if active_preset is not None:
         if not isinstance(active_preset, str) or not active_preset:
@@ -256,7 +281,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 def _validate_preset(
     name: str, preset: dict[str, Any], warnings: list[str]
 ) -> None:
-    known = {"workflow_mode", "claude_runtime", "codex"}
+    known = {"workflow_mode", "claude_runtime", "claude_model", "codex"}
     for key in preset:
         if key not in known:
             warnings.append(
@@ -278,6 +303,13 @@ def _validate_preset(
             f"presets.{name}.claude_runtime must be a non-empty string when set."
         )
 
+    model_ref = preset.get("claude_model")
+    if model_ref is not None and (
+        not isinstance(model_ref, str) or not model_ref
+    ):
+        raise ConfigError(
+            f"presets.{name}.claude_model must be a non-empty string when set."
+        )
     codex = preset.get("codex", {})
     if not isinstance(codex, dict):
         raise ConfigError(f"presets.{name}.codex must be a table.")
@@ -351,6 +383,27 @@ def _validate_claude_runtime(
         )
 
 
+def _validate_claude_model(
+    name: str, model: dict[str, Any], warnings: list[str]
+) -> None:
+    known = {"display_name", "model"}
+    for key in model:
+        if key not in known:
+            warnings.append(
+                f"Unknown key in claude_models.{name}: {key!r} (ignored)."
+            )
+    display = model.get("display_name")
+    if display is not None and (not isinstance(display, str) or not display):
+        raise ConfigError(
+            f"claude_models.{name}.display_name must be a non-empty string when set."
+        )
+    value = model.get("model")
+    if not isinstance(value, str) or not value:
+        raise ConfigError(
+            f"claude_models.{name}.model must be a non-empty string."
+        )
+
+
 _NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 
 
@@ -412,6 +465,7 @@ def resolve_effective(
         "workflow": {**default_config()["workflow"]},
         "codex": {},
         "claude_runtime": None,
+        "claude_model": None,
     }
 
     workflow = config.get("workflow", {})
@@ -434,6 +488,8 @@ def resolve_effective(
             effective["workflow"]["workflow_mode"] = preset["workflow_mode"]
         if "claude_runtime" in preset:
             effective["claude_runtime"] = preset["claude_runtime"]
+        if "claude_model" in preset:
+            effective["claude_model"] = preset["claude_model"]
         codex = preset.get("codex", {}) or {}
         for phase in VALID_PHASES:
             if phase in codex:
@@ -721,6 +777,27 @@ def set_claude_runtime(config: dict[str, Any], name: str) -> dict[str, Any]:
     return updated
 
 
+def set_claude_model(config: dict[str, Any], name: str | None) -> dict[str, Any]:
+    """Set or clear the active preset's Claude model selection."""
+    active = config.get("active_preset")
+    if not active:
+        raise ConfigError("Cannot set claude_model: no active preset is selected.")
+    presets = config.get("presets", {}) or {}
+    if active not in presets:
+        raise ConfigError(f"Active preset {active!r} is not defined.")
+    models = config.get("claude_models", {}) or {}
+    if name is not None and name not in models:
+        raise ConfigError(
+            f"claude_model {name!r} is not defined in `claude_models`."
+        )
+    updated = _deep_copy(config)
+    if name is None:
+        updated["presets"][active].pop("claude_model", None)
+    else:
+        updated["presets"][active]["claude_model"] = name
+    return updated
+
+
 def _deep_copy(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _deep_copy(v) for k, v in value.items()}
@@ -859,6 +936,7 @@ def effective_with_origin(
     subset of the returned dict via :func:`snapshot_for_run`).
     """
     effective = resolve_effective(config, preset_name=preset_name)
+    model = _resolved_claude_model(config, effective["claude_model"])
     return {
         "config_path": str(config_path),
         "config_exists": config_path.exists(),
@@ -867,6 +945,7 @@ def effective_with_origin(
             "workflow": effective["workflow"],
             "codex": effective["codex"],
             "claude_runtime": effective["claude_runtime"],
+            "claude_model": model,
         },
     }
 
@@ -909,7 +988,21 @@ def snapshot_for_run(
         "workflow": effective["workflow"],
         "codex": baked_codex,
         "claude_runtime": effective["claude_runtime"],
+        "claude_model": _resolved_claude_model(config, effective["claude_model"]),
     }
+
+
+def _resolved_claude_model(
+    config: dict[str, Any], model_id: str | None
+) -> dict[str, str] | None:
+    if model_id is None:
+        return None
+    definition = (config.get("claude_models") or {}).get(model_id) or {}
+    result = {"id": model_id, "model": str(definition["model"])}
+    display = definition.get("display_name")
+    if isinstance(display, str) and display:
+        result["display_name"] = display
+    return result
 
 
 __all__ = [
@@ -931,6 +1024,7 @@ __all__ = [
     "save_config",
     "set_active_preset",
     "set_claude_runtime",
+    "set_claude_model",
     "set_phase",
     "snapshot_for_run",
     "validate_config",

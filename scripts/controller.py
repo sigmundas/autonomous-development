@@ -4918,6 +4918,7 @@ def cmd_config_show(args: argparse.Namespace) -> int:
         "warnings": warnings,
         "presets": sorted((config.get("presets") or {}).keys()),
         "claude_runtimes": sorted((config.get("claude_runtimes") or {}).keys()),
+        "claude_models": sorted((config.get("claude_models") or {}).keys()),
     }
     if getattr(args, "json", True):
         _print_json(payload)
@@ -4970,6 +4971,7 @@ def cmd_config_list_presets(args: argparse.Namespace) -> int:
                 "name": name,
                 "workflow_mode": preset.get("workflow_mode"),
                 "claude_runtime": preset.get("claude_runtime"),
+                "claude_model": preset.get("claude_model"),
                 "phases": sorted((preset.get("codex") or {}).keys()),
             }
         )
@@ -5064,6 +5066,38 @@ def cmd_config_set_claude_runtime(args: argparse.Namespace) -> int:
             "config_path": str(path),
             "active_preset": updated.get("active_preset"),
             "claude_runtime": args.name,
+        }
+    )
+    return 0
+
+
+def cmd_config_list_claude_models(args: argparse.Namespace) -> int:
+    config, path = _load_config_for_cmd(args)
+    models = config.get("claude_models") or {}
+    result = [
+        {
+            "id": name,
+            "display_name": (models[name] or {}).get("display_name"),
+            "model": (models[name] or {}).get("model"),
+        }
+        for name in sorted(models)
+    ]
+    _print_json({"config_path": str(path), "claude_models": result})
+    return 0
+
+
+def cmd_config_set_claude_model(args: argparse.Namespace) -> int:
+    config, path = _load_config_for_cmd(args)
+    try:
+        updated = user_config.set_claude_model(config, args.name)
+    except ConfigError as exc:
+        raise WorkflowError(str(exc)) from exc
+    _persist_config(path, updated)
+    _print_json(
+        {
+            "config_path": str(path),
+            "active_preset": updated.get("active_preset"),
+            "claude_model": args.name,
         }
     )
     return 0
@@ -5436,6 +5470,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cfg_set_runtime.add_argument("name", help="Claude runtime name")
     cfg_set_runtime.set_defaults(func=cmd_config_set_claude_runtime)
+
+    cfg_models = sub.add_parser(
+        "config-list-claude-models",
+        help="List user-defined Claude model selections from the config file",
+    )
+    cfg_models.add_argument(
+        "--json", action="store_true", default=True, help=argparse.SUPPRESS
+    )
+    cfg_models.set_defaults(func=cmd_config_list_claude_models)
+
+    cfg_set_model = sub.add_parser(
+        "config-set-claude-model",
+        help="Set the active preset's Claude model, or omit NAME for Default",
+    )
+    cfg_set_model.add_argument("name", nargs="?")
+    cfg_set_model.set_defaults(func=cmd_config_set_claude_model)
 
     return parser
 
