@@ -19,12 +19,15 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 50 * 1024 * 1024
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 SCREEN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+MAX_SELECTOR_COUNT = 20
 
 
 @dataclass(frozen=True)
 class RendererConfig:
     command: list[str]
     timeout_seconds: float
+    scenario_flag: str | None = None
+    group_flag: str | None = None
 
 
 @dataclass
@@ -35,6 +38,8 @@ class UIEvidenceResult:
     manifest: dict[str, Any] | None = None
     image_paths: list[Path] | None = None
     detail: str = ""
+    selection: dict[str, list[str]] | None = None
+    selection_applied: bool = False
 
     @property
     def available(self) -> bool:
@@ -45,6 +50,37 @@ class ManifestValidationError(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+def validate_selection(
+    selection: dict[str, list[str]] | None,
+) -> tuple[dict[str, list[str]], str]:
+    """Validate persisted/agent selector data before it can become process argv."""
+    if selection is None:
+        return {"scenarios": [], "groups": []}, ""
+    if not isinstance(selection, dict):
+        return {"scenarios": [], "groups": []}, "UI review selection must be an object"
+    normalized: dict[str, list[str]] = {}
+    for field in ("scenarios", "groups"):
+        values = selection.get(field, [])
+        if not isinstance(values, list) or len(values) > MAX_SELECTOR_COUNT:
+            return {"scenarios": [], "groups": []}, (
+                f"UI review selection {field} must be an array of at most "
+                f"{MAX_SELECTOR_COUNT} IDs"
+            )
+        if any(
+            not isinstance(value, str) or not SCREEN_ID_PATTERN.fullmatch(value)
+            for value in values
+        ):
+            return {"scenarios": [], "groups": []}, (
+                f"UI review selection {field} contains an invalid ID"
+            )
+        if len(values) != len(set(values)):
+            return {"scenarios": [], "groups": []}, (
+                f"UI review selection {field} contains duplicate IDs"
+            )
+        normalized[field] = list(values)
+    return normalized, ""
 
 
 def load_renderer_config(repo_root: Path) -> tuple[RendererConfig | None, str]:
@@ -76,7 +112,15 @@ def load_renderer_config(repo_root: Path) -> tuple[RendererConfig | None, str]:
     timeout = section.get("timeout_seconds", 120)
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
         return None, "ui_review.timeout_seconds must be positive"
-    return RendererConfig(list(command), float(timeout)), ""
+    flags: dict[str, str | None] = {}
+    for field in ("scenario_flag", "group_flag"):
+        value = section.get(field)
+        if value is not None and (
+            not isinstance(value, str) or not value or len(value) > 128
+        ):
+            return None, f"ui_review.{field} must be a non-empty bounded string"
+        flags[field] = value
+    return RendererConfig(list(command), float(timeout), **flags), ""
 
 
 def _validate_optional_text(screen: dict[str, Any], field: str) -> None:
@@ -169,40 +213,101 @@ def render_ui_evidence(
     repo_root: Path,
     output_dir: Path,
     runner: Callable[..., Any],
+    selection: dict[str, list[str]] | None = None,
 ) -> UIEvidenceResult:
-    """Run the configured argv command, appending the run-owned output directory."""
+    """Run configured argv, optional declared selectors, then the output directory."""
     config, config_error = load_renderer_config(repo_root)
     if config is None:
         status = "invalid_config" if config_error else "not_configured"
         return UIEvidenceResult(status, bool(config_error), detail=config_error)
 
+    normalized, selection_error = validate_selection(selection)
+    if selection_error:
+        return UIEvidenceResult(
+            "invalid_selection", True, detail=selection_error, selection=normalized
+        )
+    scenarios = list(normalized.get("scenarios") or [])
+    groups = list(normalized.get("groups") or [])
+    selector_args: list[str] = []
+    selector_capable = bool(config.scenario_flag or config.group_flag)
+    unsupported = []
+    if selector_capable and scenarios and not config.scenario_flag:
+        unsupported.append("scenarios")
+    if selector_capable and groups and not config.group_flag:
+        unsupported.append("groups")
+    if unsupported:
+        return UIEvidenceResult(
+            "unsupported_selection",
+            True,
+            detail=(
+                "repository renderer configuration does not declare selector flags for: "
+                + ", ".join(unsupported)
+            ),
+            selection=normalized,
+        )
+    if config.group_flag:
+        for group in groups:
+            selector_args.extend((config.group_flag, group))
+    if config.scenario_flag:
+        for scenario in scenarios:
+            selector_args.extend((config.scenario_flag, scenario))
+    selection_applied = bool(selector_args)
+
     output_dir.mkdir(parents=True, exist_ok=False)
-    command = [*config.command, str(output_dir)]
+    command = [*config.command, *selector_args, str(output_dir)]
     try:
         result = runner(command, cwd=repo_root, timeout=config.timeout_seconds)
     except Exception as exc:  # runner normalizes platform-specific spawn failures
         detail = str(exc)
         status = "command_unavailable" if "not found" in detail.lower() else "renderer_error"
-        return UIEvidenceResult(status, True, output_dir=output_dir, detail=detail)
+        return UIEvidenceResult(
+            status,
+            True,
+            output_dir=output_dir,
+            detail=detail,
+            selection=normalized,
+            selection_applied=selection_applied,
+        )
 
     (output_dir / "renderer.stdout.log").write_text(result.stdout or "", encoding="utf-8")
     (output_dir / "renderer.stderr.log").write_text(result.stderr or "", encoding="utf-8")
     if result.returncode == 124:
         return UIEvidenceResult(
-            "timeout", True, output_dir=output_dir, detail="renderer timed out"
-        )
-    if result.returncode != 0:
-        return UIEvidenceResult(
-            "nonzero_exit",
+            "timeout",
             True,
             output_dir=output_dir,
-            detail=f"renderer exited with status {result.returncode}",
+            detail="renderer timed out",
+            selection=normalized,
+            selection_applied=selection_applied,
+        )
+    if result.returncode != 0:
+        stderr = " ".join((result.stderr or "").strip().split())[:1000]
+        if selection_applied:
+            detail = "renderer rejected requested UI review selection"
+            if stderr:
+                detail += f": {stderr}"
+            status = "selector_rejected"
+        else:
+            detail = f"renderer exited with status {result.returncode}"
+            status = "nonzero_exit"
+        return UIEvidenceResult(
+            status,
+            True,
+            output_dir=output_dir,
+            detail=detail,
+            selection=normalized,
+            selection_applied=selection_applied,
         )
     try:
         manifest, image_paths = validate_manifest(output_dir)
     except ManifestValidationError as exc:
         return UIEvidenceResult(
-            exc.code, True, output_dir=output_dir, detail=str(exc)
+            exc.code,
+            True,
+            output_dir=output_dir,
+            detail=str(exc),
+            selection=normalized,
+            selection_applied=selection_applied,
         )
     return UIEvidenceResult(
         "success",
@@ -210,6 +315,8 @@ def render_ui_evidence(
         output_dir=output_dir,
         manifest=manifest,
         image_paths=image_paths,
+        selection=normalized,
+        selection_applied=selection_applied,
     )
 
 
@@ -225,9 +332,16 @@ def visual_prompt(result: UIEvidenceResult, attached: bool) -> str:
             "Continue the normal code and correctness review; do not assume screenshots exist."
         )
     metadata = json.dumps(result.manifest, indent=2, ensure_ascii=False)
+    selection_note = ""
+    if result.selection_applied:
+        selection_note = (
+            "These fresh screenshots were selected as relevant to the current "
+            "implementation. They are not necessarily exhaustive UI coverage.\n"
+        )
     return (
         "\n\nCURRENT-ROUND UI SCREENSHOT EVIDENCE\n"
-        "The attached images were generated for this review round only. Manifest metadata:\n"
+        "The attached images were generated for this review round only. "
+        f"{selection_note}Manifest metadata:\n"
         f"{metadata}\n\n"
         "Use the images as additive evidence. Check clipping/truncation, control placement, "
         "excessive dimensions, translation/layout breakage, visual hierarchy, enabled/disabled "

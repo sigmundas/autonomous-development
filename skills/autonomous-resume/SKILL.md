@@ -12,9 +12,14 @@ allowed-tools:
   - Write
   - LSP
   - Agent
-  - Bash(git *)
-  - Bash(python3 *)
-  - Bash(codex *)
+  - Bash(git status:*)
+  - Bash(git diff:*)
+  - Bash(git log:*)
+  - Bash(git show:*)
+  - Bash(git rev-parse:*)
+  - Bash(git ls-files:*)
+  - Bash(python3:*)
+  - Bash(codex:*)
 disallowed-tools:
   - AskUserQuestion
   - EnterWorktree
@@ -50,7 +55,7 @@ stop and request an explicit run ID without calling the controller.
   chain, redirect, wrap, or retry commands merely to inspect output or exit status.
 - Preserve the existing run's snapshotted mode, runtime configuration, review budget, risk gate,
   verification requirements, and human-decision state. Never weaken gates or bypass a phase.
-- Stop only when the controller reports `complete`, `blocked`, `cancelled`, or a genuine recorded
+- Stop only when the controller reports `complete`, `complete_with_followups`, `blocked`, `cancelled`, or a genuine recorded
   human-decision pause. Never create commits unless the user explicitly requested them. Never
   push, merge, publish, deploy, rotate credentials, or modify remote infrastructure.
 
@@ -64,6 +69,7 @@ submitting this skill invocation as the first prompt.
 
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" --run-id "$ARGUMENTS" status --json
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" --run-id "$ARGUMENTS" continuation-context --json
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" --run-id "$ARGUMENTS" next-action --json
    ```
 
@@ -86,9 +92,9 @@ submitting this skill invocation as the first prompt.
    After satisfying a phase completion condition, call explicit-run `next-action --json` again.
 
 3. Respect human decisions. If status or next-action reports an existing human-decision pause,
-   surface the recorded decision and stop. A `review-budget-exhausted` pause specifically requires
-   the human to invoke/approve `authorize-review`; do not clear it with generic `resume` and do not
-   imply the last `changes_required` review passed. After the user supplies any other decision,
+   surface the recorded decision and stop. Review-budget exhaustion routes to completion
+   disposition and does not itself require a human; `authorize-review` remains available for one
+   explicit confirmation round. Do not imply the last `changes_required` review passed. After the user supplies any other decision,
    record it on the same run and continue:
 
    ```bash
@@ -103,7 +109,8 @@ submitting this skill invocation as the first prompt.
    `continue-run --intent <allow-one-more-review|resume-adversarial|continue-blocked>` on that exact
    parent id; continue only in the linked child run returned by the controller. Reuse an existing
    active child returned by the controller rather than creating another. Cancelled, archived, and
-   complete runs are not continuation sources.
+   successful runs are not blocked-continuation sources; selected durable follow-ups from a
+   `complete_with_followups` run start a semantically new run via `start-followup-run`.
 
 4. When next-action reports `phase: evaluate`, finish through the same gates and report from the
    same run:

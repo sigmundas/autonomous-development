@@ -55,17 +55,36 @@ def reason_for(state: dict, run_dir: Path) -> str:
         return (
             "Continue the autonomous workflow: run the independent Codex code review."
         )
-    if reviews[-1].get("verdict") != "pass":
+    evaluation = state.get("completion_evaluation", {})
+    evaluation_result = (
+        evaluation.get("result") if isinstance(evaluation, dict) else None
+    )
+    if reviews[-1].get("verdict") != "pass" and evaluation_result not in {
+        "ready",
+        "ready_with_followups",
+    }:
+        if evaluation_result == "must_fix_now":
+            return (
+                "Continue the autonomous workflow: fix MUST_FIX_NOW findings, "
+                "verify, and re-review."
+            )
         return (
-            "Continue the autonomous workflow: triage the latest Codex findings, "
-            "fix valid issues, verify, and re-review."
+            "Continue the autonomous workflow: run completion disposition for "
+            "every remaining review finding."
         )
     if state.get("risk", {}).get("requires_adversarial_review"):
         adversarial = state.get("adversarial_reviews", [])
-        if not adversarial or adversarial[-1].get("verdict") != "pass":
+        if not adversarial:
             return (
-                "Continue the autonomous workflow: complete the required adversarial review "
-                "and address valid risks."
+                "Continue the autonomous workflow: complete the required adversarial review."
+            )
+        if adversarial[-1].get("verdict") != "pass" and evaluation_result not in {
+            "ready",
+            "ready_with_followups",
+        }:
+            return (
+                "Continue the autonomous workflow: disposition every remaining "
+                "adversarial threat against accepted scope and hard safety gates."
             )
     return "Run the controller completion-gate evaluation and provide the final implementation report."
 

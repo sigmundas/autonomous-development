@@ -14,9 +14,14 @@ allowed-tools:
   - Agent
   - EnterWorktree
   - ExitWorktree
-  - Bash(git *)
-  - Bash(python3 *)
-  - Bash(codex *)
+  - Bash(git status:*)
+  - Bash(git diff:*)
+  - Bash(git log:*)
+  - Bash(git show:*)
+  - Bash(git rev-parse:*)
+  - Bash(git ls-files:*)
+  - Bash(python3:*)
+  - Bash(codex:*)
 disallowed-tools:
   - AskUserQuestion
 hooks:
@@ -55,7 +60,7 @@ lives in `references/` and is loaded only when a phase needs it.
   `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" codex --phase plan` directly, not a
   redirected or chained wrapper.
 - **Terminate only on a controller-authorized state.** Stop when the controller reports the run
-  as `complete`, `blocked`, `cancelled`, or when you have explicitly marked it awaiting a genuine
+  as `complete`, `complete_with_followups`, `blocked`, `cancelled`, or when you have explicitly marked it awaiting a genuine
   human decision via `controller.py await-decision --reason "..."`. Do not otherwise decide the
   workflow is finished.
 

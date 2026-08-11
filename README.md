@@ -491,6 +491,8 @@ By default, run autonomous development in an isolated worktree. This fork also s
   `CLAUDE_AUTONOMOUS_PHASE_PROFILES` (JSON) and `CLAUDE_AUTONOMOUS_CODEX_MODEL_<PHASE>`.
 - Optionally configure a deterministic repository-owned screenshot renderer as
   described in [`docs/ui-review-evidence.md`](docs/ui-review-evidence.md).
+  Repositories may declare scenario/group selector flags so implementation and fix
+  results can request a focused, fresh evidence set for each review round.
 
 ## Compatibility note
 

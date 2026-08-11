@@ -138,6 +138,32 @@ class LoadValidateTests(_TempMixin):
         with self.assertRaises(user_config.ConfigError):
             user_config.validate_config(cfg)
 
+    def test_claude_model_reference_is_extensible_and_validated(self) -> None:
+        cfg = user_config.default_config()
+        cfg["claude_models"]["custom-opus"] = {
+            "display_name": "My Custom Opus",
+            "model": "provider/custom-opus-exact",
+        }
+        cfg["presets"]["p"] = {"claude_model": "custom-opus"}
+        cfg["active_preset"] = "p"
+        self.assertEqual(user_config.validate_config(cfg), [])
+        cfg["presets"]["p"]["claude_model"] = "missing"
+        with self.assertRaises(user_config.ConfigError):
+            user_config.validate_config(cfg)
+
+    def test_runtime_accepts_safe_custom_command_and_rejects_shell_or_dangerous_git(self) -> None:
+        cfg = user_config.default_config()
+        cfg["claude_runtimes"]["local"] = {
+            "launcher": "/usr/bin/claude",
+            "allowed_commands": ["ruff", "npm run test"],
+            "executable_paths": ["/opt/homebrew/bin"],
+        }
+        self.assertEqual(user_config.validate_config(cfg), [])
+        for unsafe in ("uv && rm -rf .", "bash", "git reset --hard", "git push"):
+            cfg["claude_runtimes"]["local"]["allowed_commands"] = [unsafe]
+            with self.assertRaises(user_config.ConfigError):
+                user_config.validate_config(cfg)
+
     def test_unknown_top_level_key_is_warning_not_error(self) -> None:
         cfg = user_config.default_config()
         cfg["mystery"] = 1
@@ -260,6 +286,16 @@ class ProfileDiscoveryTests(_TempMixin):
 
 
 class MutationTests(_TempMixin):
+    def test_set_and_clear_claude_model(self) -> None:
+        cfg = user_config.default_config()
+        cfg["claude_models"]["sonnet"] = {"model": "exact-sonnet-value"}
+        cfg["presets"]["p"] = {}
+        cfg["active_preset"] = "p"
+        selected = user_config.set_claude_model(cfg, "sonnet")
+        self.assertEqual(selected["presets"]["p"]["claude_model"], "sonnet")
+        cleared = user_config.set_claude_model(selected, None)
+        self.assertNotIn("claude_model", cleared["presets"]["p"])
+
     def test_set_phase_preserves_other_presets_and_phases(self) -> None:
         path = self.make_tmp() / "config.toml"
         cfg = user_config.default_config()
@@ -376,6 +412,60 @@ class ConfigCliTests(_TempMixin):
         self.assertFalse(payload["config_exists"])
         self.assertIsNone(payload["active_preset"])
 
+    def test_global_config_commands_work_outside_git(self) -> None:
+        non_repo = self.make_tmp()
+        non_repo.mkdir(parents=True, exist_ok=True)
+        state_home = self.make_tmp()
+        state_home.mkdir(parents=True, exist_ok=True)
+        codex = self._codex_home_with(["outside-git"])
+        (state_home / "config.toml").write_text(
+            '[claude_runtimes.local]\nlauncher = "/bin/sh"\n\n'
+            '[claude_models.custom]\ndisplay_name = "Custom"\nmodel = "custom/exact"\n\n'
+            '[presets.global]\nworkflow_mode = "standard"\n'
+        )
+
+        for command in (
+            ("config-show",),
+            ("config-list-presets",),
+            ("config-list-profiles",),
+            ("config-list-claude-runtimes",),
+            ("config-list-claude-models",),
+            ("config-validate",),
+            ("config-set-active-preset", "global"),
+            ("config-set-claude-runtime", "local"),
+            ("config-set-claude-model", "custom"),
+            (
+                "config-set-phase",
+                "--preset",
+                "global",
+                "--phase",
+                "plan",
+                "--profile",
+                "outside-git",
+            ),
+        ):
+            result = self._controller(
+                non_repo, state_home, *command, codex_home=codex
+            )
+            self.assertEqual(result.returncode, 0, (command, result.stderr))
+
+        profiles = json.loads(
+            self._controller(
+                non_repo,
+                state_home,
+                "config-list-profiles",
+                codex_home=codex,
+            ).stdout
+        )
+        self.assertIn("outside-git", {p["id"] for p in profiles["profiles"]})
+
+    def test_run_command_still_rejects_non_git_project_root(self) -> None:
+        non_repo = self.make_tmp()
+        non_repo.mkdir(parents=True, exist_ok=True)
+        result = self._controller(non_repo, self.make_tmp(), "list-runs")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("git repository", result.stderr.lower())
+
     def test_config_set_active_preset_then_show(self) -> None:
         repo = self.make_repo()
         state_home = self.make_tmp()
@@ -414,6 +504,38 @@ class ConfigCliTests(_TempMixin):
         self.assertEqual(payload["active_preset"], "azure-autonomous")
         self.assertEqual(
             payload["effective"]["codex"]["plan"]["profile"], "azure-x"
+        )
+
+    def test_init_snapshots_selected_claude_model(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_tmp()
+        cfg = user_config.default_config()
+        cfg["claude_models"]["custom"] = {
+            "display_name": "Custom Model",
+            "model": "provider/custom-exact",
+        }
+        cfg["presets"]["benchmark"] = {"claude_model": "custom"}
+        cfg["active_preset"] = "benchmark"
+        user_config.save_config(state_home / "config.toml", cfg)
+        result = self._controller(
+            repo,
+            state_home,
+            "init",
+            "--feature",
+            "benchmark model",
+            "--mode",
+            "standard",
+            codex_home=self.make_tmp(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(Path(result.stdout.strip()).read_text(encoding="utf-8"))
+        self.assertEqual(
+            state["config_snapshot"]["claude_model"],
+            {
+                "id": "custom",
+                "display_name": "Custom Model",
+                "model": "provider/custom-exact",
+            },
         )
 
     def test_config_validate_rejects_bad_toml(self) -> None:
@@ -781,6 +903,21 @@ class ActivePresetProfileValidationTests(_TempMixin):
 
 
 class SnapshotStabilityTests(_TempMixin):
+    def test_claude_model_snapshot_resolves_definition_and_stays_immutable(self) -> None:
+        cfg = user_config.default_config()
+        cfg["claude_models"]["sonnet"] = {
+            "display_name": "Sonnet",
+            "model": "sonnet-exact-v1",
+        }
+        cfg["presets"]["p"] = {"claude_model": "sonnet"}
+        cfg["active_preset"] = "p"
+        snapshot = user_config.snapshot_for_run(cfg)
+        cfg["claude_models"]["sonnet"]["model"] = "sonnet-later-v2"
+        self.assertEqual(
+            snapshot["claude_model"],
+            {"id": "sonnet", "display_name": "Sonnet", "model": "sonnet-exact-v1"},
+        )
+
     """Env-resolved values are frozen at init; later env changes have no effect."""
 
     def _repo(self) -> Path:

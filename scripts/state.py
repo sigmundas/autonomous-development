@@ -19,7 +19,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 STATE_SCHEMA_VERSION = 2
 TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"complete", "blocked", "cancelled", "archived"}
+    {"complete", "complete_with_followups", "blocked", "cancelled", "archived"}
 )
 LEGACY_STATE_REL = Path(".ai/autonomous-development")
 LEGACY_STATE_FILE_NAME = "run-state.json"
@@ -851,7 +851,10 @@ def resolve_active_run(
 TRANSITION_POLICY: dict[str, tuple[frozenset[str], str]] = {
     "cancel": (frozenset({"active"}), "cancelled"),
     "block": (frozenset({"active"}), "blocked"),
-    "archive-run": (frozenset({"complete", "blocked", "cancelled"}), "archived"),
+    "archive-run": (
+        frozenset({"complete", "complete_with_followups", "blocked", "cancelled"}),
+        "archived",
+    ),
 }
 
 

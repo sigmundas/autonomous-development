@@ -7,6 +7,9 @@ post-0.2 development history. They remain here with their original attribution
 and are not claimed as functionality first introduced by this fork.
 
 ### Added
+- Task-specific UI review selection: validated implementation/fix work results can
+  name repository-owned scenario IDs or groups, repositories opt into selector argv
+  flags, and each review round renders and records a fresh focused evidence set.
 - Evidence-preserving cumulative review ledger: each entry in `cumulative_findings`
   now stores the full review evidence inline (`file`, `line_start`, `description`,
   `evidence`, `recommended_fix`) plus an `origin` provenance tag

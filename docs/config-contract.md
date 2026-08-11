@@ -112,6 +112,7 @@ workflow_mode = "standard"           # optional default; presets override
 [presets.azure-autonomous]
 workflow_mode = "standard"           # auto | lean | standard | rigorous
 claude_runtime = "azure-claude"      # name of a [claude_runtimes.*] entry
+claude_model = "sonnet"               # optional [claude_models.*] entry
 
 [presets.azure-autonomous.codex.enhance]
 profile = "azure-gpt5p6-sol"         # Codex profile id
@@ -136,7 +137,31 @@ launcher = "/Users/example/bin/claude-anthropic"
 [claude_runtimes.azure-claude]
 display_name = "Azure · Claude"
 launcher = "/Users/example/bin/claude-azure"
+allowed_commands = ["ruff", "npm run test"]
+executable_paths = ["/opt/homebrew/bin", "~/.local/bin"]
+
+[claude_models.sonnet]
+display_name = "Sonnet"
+model = "sonnet"                      # exact value accepted by claude --model
+
+[claude_models.opus]
+display_name = "Opus"
+model = "opus"
+
+[claude_models.sonnet46-foundry]
+display_name = "Sonnet 4.6 · 1M"
+model = "claude-sonnet-4-6"
+
+[claude_models.opus48-foundry]
+display_name = "Opus 4.8 · 1M"
+model = "claude-opus-4-8"
 ```
+
+These are examples, not a built-in catalog. Define the stable ids, labels, and
+exact `claude --model` values supported by your Claude Code account/provider.
+The runtime selects the launcher environment; the model independently selects
+the Claude session model. Omit `claude_model` from a preset for Default behavior
+with no explicit `--model` argument.
 
 Constraints enforced at validation time:
 
@@ -148,6 +173,15 @@ Constraints enforced at validation time:
 - `workflow_mode` must be one of `auto | lean | standard | rigorous`.
 - `active_preset`, when set, must name a defined preset.
 - A preset's `claude_runtime`, when set, must name a defined runtime.
+- Runtime `allowed_commands` entries are simple executable/subcommand prefixes.
+  Shell syntax, shell launchers, and destructive or unbounded Git commands are rejected.
+- Runtime `executable_paths` entries are prepended to the inherited Claude/controller
+  PATH. They provide predictable direct executable lookup without a login-shell wrapper.
+  The VS Code launcher also prepends the directory containing an absolute Claude launcher.
+- A preset's optional `claude_model` must name a defined model. Omitting it is
+  the Default selection and does not pass `--model` to Claude Code.
+- Claude model definitions are user-extensible; no provider catalog is
+  hardcoded. The exact CLI value is persisted into each run snapshot.
 - Secret-shaped keys (`api_key`, `token`, `bearer`, `password`,
   `credential(s)`, `authorization`) are refused at any depth. The
   autonomous config never stores credentials.
@@ -253,6 +287,7 @@ other secrets, even if the source profile file contains them: only `id`,
       "name": "azure-autonomous",
       "workflow_mode": "standard",
       "claude_runtime": "azure-claude",
+      "claude_model": "sonnet",
       "phases": ["enhance", "plan", "review", "adversarial"]
     }
   ]
@@ -270,6 +305,8 @@ other secrets, even if the source profile file contains them: only `id`,
       "display_name": "Azure · Claude",
       "launcher": "/Users/…/bin/claude-azure",
       "args": [],
+      "allowed_commands": ["ruff"],
+      "executable_paths": ["/opt/homebrew/bin"],
       "launcher_exists": true,
       "launcher_executable": true
     }
@@ -279,6 +316,17 @@ other secrets, even if the source profile file contains them: only `id`,
 
 `launcher_exists` / `launcher_executable` are best-effort filesystem
 checks; the controller never invokes the launcher during validation.
+
+### `config-list-claude-models`
+
+Returns the user-defined stable ids, display names, and exact Claude CLI model
+values. The list is configuration-driven and is not restricted to a built-in
+catalog.
+
+### `config-set-claude-model [NAME]`
+
+Sets the active preset's `claude_model` reference. Omitting `NAME` selects
+Default by removing the reference, so new launches do not pass `--model`.
 
 ### `config-set-active-preset NAME`
 

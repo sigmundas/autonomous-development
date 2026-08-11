@@ -3,7 +3,7 @@ name: fix-findings
 description: Triage the latest Codex review findings, fix evidence-backed issues, add regression tests, rerun verification, and prepare the implementation for a fresh independent review.
 disable-model-invocation: true
 effort: max
-allowed-tools: Read Grep Glob Edit Write LSP Bash(git *) Bash(python3 *)
+allowed-tools: Read Grep Glob Edit Write LSP Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git rev-parse:*) Bash(git ls-files:*) Bash(python3:*)
 disallowed-tools: AskUserQuestion
 ---
 
@@ -24,3 +24,8 @@ disallowed-tools: AskUserQuestion
 6. Rerun all affected verification checks using the controller.
 7. Do not automatically implement low-confidence stylistic suggestions.
 8. Do not exceed the configured review-round budget; mark the run blocked when a safe resolution requires external product or operational authority.
+9. If fixes change UI evidence relevance, record a structured result with
+   `controller.py record-work-result --kind fix --file <fix-result.json>`. The optional
+   `ui_review.groups`/`ui_review.scenarios` selection replaces the previous selection; omitting it
+   preserves the prior selection for re-review. Use only repository-registered IDs and choose the
+   smallest useful changed plus adjacent-risk set.

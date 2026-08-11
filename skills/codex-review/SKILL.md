@@ -3,7 +3,7 @@ name: codex-review
 description: Run a fresh independent read-only Codex review of all implementation changes against the baseline, accepted specification, plan, and recorded verification.
 disable-model-invocation: true
 effort: max
-allowed-tools: Read Grep Glob Bash(git *) Bash(python3 *) Bash(codex *)
+allowed-tools: Read Grep Glob Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git rev-parse:*) Bash(git ls-files:*) Bash(python3:*) Bash(codex:*)
 disallowed-tools: AskUserQuestion Edit Write
 ---
 
