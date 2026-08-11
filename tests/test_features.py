@@ -756,5 +756,56 @@ class CompactContextTests(unittest.TestCase):
         self.assertEqual(controller.render_finding_ledger({}), "(none)")
 
 
+class CodexSessionTelemetryTests(unittest.TestCase):
+    def telemetry(self, **overrides):
+        values = {
+            "reuse_enabled": True,
+            "resume_supported": True,
+            "resume_id": None,
+            "resume_fallback": False,
+            "rotation": False,
+        }
+        values.update(overrides)
+        return controller.codex_session_telemetry(**values)
+
+    def test_first_round_with_reuse_is_fresh_not_fallback(self) -> None:
+        self.assertEqual(
+            self.telemetry(),
+            {
+                "session_mode": "fresh",
+                "session_rotation": False,
+                "session_fallback": False,
+                "session_resume_capability": "supported",
+            },
+        )
+
+    def test_reuse_disabled_is_plain_fresh(self) -> None:
+        value = self.telemetry(reuse_enabled=False, resume_supported=False)
+        self.assertEqual(value["session_mode"], "fresh")
+        self.assertFalse(value["session_fallback"])
+        self.assertNotIn("session_resume_capability", value)
+
+    def test_unsupported_resume_is_not_a_fallback(self) -> None:
+        value = self.telemetry(resume_supported=False)
+        self.assertEqual(value["session_resume_capability"], "unsupported")
+        self.assertFalse(value["session_fallback"])
+
+    def test_successful_resume(self) -> None:
+        value = self.telemetry(resume_id="session-1")
+        self.assertEqual(value["session_mode"], "resumed")
+        self.assertFalse(value["session_fallback"])
+
+    def test_failed_resume_is_fresh_fallback(self) -> None:
+        value = self.telemetry(resume_id="session-1", resume_fallback=True)
+        self.assertEqual(value["session_mode"], "fresh")
+        self.assertTrue(value["session_fallback"])
+
+    def test_bounded_rotation_is_fresh_without_fallback(self) -> None:
+        value = self.telemetry(rotation=True)
+        self.assertEqual(value["session_mode"], "fresh")
+        self.assertTrue(value["session_rotation"])
+        self.assertFalse(value["session_fallback"])
+
+
 if __name__ == "__main__":
     unittest.main()

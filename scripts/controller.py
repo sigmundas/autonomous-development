@@ -806,6 +806,27 @@ def codex_resume_supports_safe_structured_exec() -> bool:
     )
 
 
+def codex_session_telemetry(
+    *,
+    reuse_enabled: bool,
+    resume_supported: bool,
+    resume_id: str | None,
+    resume_fallback: bool,
+    rotation: bool,
+) -> dict[str, Any]:
+    """Describe session behavior without treating unavailable reuse as failure."""
+    result: dict[str, Any] = {
+        "session_mode": "resumed" if resume_id and not resume_fallback else "fresh",
+        "session_rotation": rotation,
+        "session_fallback": resume_fallback,
+    }
+    if reuse_enabled:
+        result["session_resume_capability"] = (
+            "supported" if resume_supported else "unsupported"
+        )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Workflow modes
 # ---------------------------------------------------------------------------
@@ -2461,15 +2482,15 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 "events_artifact": make_relative_path(events_path, run_dir),
                 "output_artifact": make_relative_path(final_path, run_dir),
                 "session_family": family,
-                "session_mode": "resumed" if resume_id and not resume_fallback else "fresh",
                 "round": family_round,
-                "session_rotation": rotation,
-                "session_fallback": resume_fallback,
+                **codex_session_telemetry(
+                    reuse_enabled=reuse_review_context,
+                    resume_supported=resume_supported,
+                    resume_id=resume_id,
+                    resume_fallback=resume_fallback,
+                    rotation=rotation,
+                ),
             }
-            if reuse_review_context:
-                usage_record["session_resume_capability"] = (
-                    "supported" if resume_supported else "unsupported"
-                )
             if returned_session_id:
                 usage_record["session_id"] = returned_session_id
             if token_usage:
