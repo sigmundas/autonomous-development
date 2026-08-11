@@ -1071,7 +1071,8 @@ def snapshot_for_run(
             "display_name": runtime.get("display_name"),
             "launcher": runtime.get("launcher"),
             "args": list(runtime.get("args", [])),
-            "safe_commands": list(runtime.get("safe_commands", [])),
+            "allowed_commands": list(runtime.get("allowed_commands", [])),
+            "executable_paths": list(runtime.get("executable_paths", [])),
         }
     result = {
         "preset": effective["active_preset"],

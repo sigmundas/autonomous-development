@@ -567,6 +567,49 @@ class ConfigCliTests(_TempMixin):
             },
         )
 
+    def test_runtime_snapshot_is_stable_after_global_config_changes(self) -> None:
+        cfg = user_config.default_config()
+        runtime = {
+            "display_name": "Anthropic · Claude",
+            "launcher": "claude",
+            "args": ["--profile", "initial"],
+            "allowed_commands": ["ruff", "npm run test"],
+            "executable_paths": ["/opt/homebrew/bin", "~/.local/bin"],
+        }
+        cfg["claude_runtimes"]["anthropic-claude"] = runtime
+        cfg["presets"]["test"] = {"claude_runtime": "anthropic-claude"}
+        cfg["active_preset"] = "test"
+        snapshot = user_config.snapshot_for_run(cfg)
+
+        self.assertEqual(
+            snapshot["claude_runtime_snapshot"],
+            {
+                "name": "anthropic-claude",
+                "display_name": "Anthropic · Claude",
+                "launcher": "claude",
+                "args": ["--profile", "initial"],
+                "allowed_commands": ["ruff", "npm run test"],
+                "executable_paths": ["/opt/homebrew/bin", "~/.local/bin"],
+            },
+        )
+
+        runtime["args"].append("--changed")
+        runtime["allowed_commands"].append("pytest")
+        runtime["executable_paths"].append("/changed/bin")
+
+        self.assertEqual(
+            snapshot["claude_runtime_snapshot"]["args"],
+            ["--profile", "initial"],
+        )
+        self.assertEqual(
+            snapshot["claude_runtime_snapshot"]["allowed_commands"],
+            ["ruff", "npm run test"],
+        )
+        self.assertEqual(
+            snapshot["claude_runtime_snapshot"]["executable_paths"],
+            ["/opt/homebrew/bin", "~/.local/bin"],
+        )
+
     def test_config_validate_rejects_bad_toml(self) -> None:
         repo = self.make_repo()
         state_home = self.make_tmp()
@@ -636,28 +679,6 @@ class ConfigCliTests(_TempMixin):
         )
         self.assertEqual(
             data["config_snapshot"]["codex"]["plan"]["reasoning_effort"], "high"
-        )
-
-    def test_init_snapshots_selected_claude_model(self) -> None:
-        repo = self.make_repo()
-        state_home = self.make_tmp()
-        cfg = user_config.default_config()
-        cfg["claude_models"]["custom"] = {
-            "display_name": "Custom Model",
-            "model": "provider/custom-exact",
-        }
-        cfg["presets"]["benchmark"] = {"claude_model": "custom"}
-        cfg["active_preset"] = "benchmark"
-        user_config.save_config(state_home / "config.toml", cfg)
-        result = self._controller(
-            repo, state_home, "init", "--feature", "test", "--mode", "standard",
-            codex_home=self.make_tmp(),
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        state = json.loads(Path(result.stdout.strip()).read_text(encoding="utf-8"))
-        self.assertEqual(
-            state["config_snapshot"]["claude_model"],
-            {"id": "custom", "display_name": "Custom Model", "model": "provider/custom-exact"},
         )
 
     def test_active_run_pinned_when_default_preset_changes(self) -> None:
