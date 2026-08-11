@@ -434,6 +434,7 @@ class ConfigCliTests(_TempMixin):
             ("config-set-active-preset", "global"),
             ("config-set-claude-runtime", "local"),
             ("config-set-claude-model", "custom"),
+            ("config-set-review-context-reuse", "true"),
             (
                 "config-set-phase",
                 "--preset",
@@ -458,6 +459,21 @@ class ConfigCliTests(_TempMixin):
             ).stdout
         )
         self.assertIn("outside-git", {p["id"] for p in profiles["profiles"]})
+        payload = json.loads(
+            self._controller(non_repo, state_home, "config-show", codex_home=codex).stdout
+        )
+        self.assertEqual(payload["effective"]["claude_model"]["model"], "custom/exact")
+        self.assertTrue(payload["effective"]["workflow"]["reuse_codex_review_context"])
+
+    def test_config_show_succeeds_from_filesystem_root_without_project_root(self) -> None:
+        state_home = self.make_tmp()
+        result = subprocess.run(
+            [sys.executable, str(CONTROLLER), "--state-dir", str(state_home), "config-show", "--json"],
+            cwd="/",
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_run_command_still_rejects_non_git_project_root(self) -> None:
         non_repo = self.make_tmp()
@@ -607,6 +623,28 @@ class ConfigCliTests(_TempMixin):
         )
         self.assertEqual(
             data["config_snapshot"]["codex"]["plan"]["reasoning_effort"], "high"
+        )
+
+    def test_init_snapshots_selected_claude_model(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_tmp()
+        cfg = user_config.default_config()
+        cfg["claude_models"]["custom"] = {
+            "display_name": "Custom Model",
+            "model": "provider/custom-exact",
+        }
+        cfg["presets"]["benchmark"] = {"claude_model": "custom"}
+        cfg["active_preset"] = "benchmark"
+        user_config.save_config(state_home / "config.toml", cfg)
+        result = self._controller(
+            repo, state_home, "init", "--feature", "test", "--mode", "standard",
+            codex_home=self.make_tmp(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(Path(result.stdout.strip()).read_text(encoding="utf-8"))
+        self.assertEqual(
+            state["config_snapshot"]["claude_model"],
+            {"id": "custom", "display_name": "Custom Model", "model": "provider/custom-exact"},
         )
 
     def test_active_run_pinned_when_default_preset_changes(self) -> None:
@@ -1148,6 +1186,43 @@ class PresetWorkflowModeCliTests(_TempMixin):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["requested_mode"], "auto")
         self.assertEqual(state["mode_origin"], "default")
+
+
+class ReviewContextConfigurationTests(unittest.TestCase):
+    def test_default_is_backward_compatible_fresh_reviews(self) -> None:
+        cfg = user_config.default_config()
+        self.assertFalse(cfg["workflow"]["reuse_codex_review_context"])
+
+    def test_toggle_is_validated_and_snapshotted(self) -> None:
+        cfg = user_config.set_review_context_reuse(user_config.default_config(), True)
+        user_config.validate_config(cfg)
+        snap = user_config.snapshot_for_run(cfg)
+        self.assertTrue(snap["workflow"]["reuse_codex_review_context"])
+        cfg["workflow"]["reuse_codex_review_context"] = False
+        self.assertTrue(snap["workflow"]["reuse_codex_review_context"])
+
+    def test_non_boolean_toggle_is_rejected(self) -> None:
+        cfg = user_config.default_config()
+        cfg["workflow"]["reuse_codex_review_context"] = "yes"
+        with self.assertRaises(user_config.ConfigError):
+            user_config.validate_config(cfg)
+
+    def test_runtime_efficiency_workflow_fields_survive_model_snapshot(self) -> None:
+        cfg = user_config.default_config()
+        cfg["workflow"].update(
+            {
+                "reuse_codex_review_context": True,
+                "codex_review_session_max_turns": 4,
+                "executable_search_paths": ["/opt/dev/bin"],
+            }
+        )
+        cfg["claude_models"]["custom"] = {"model": "custom-exact"}
+        cfg["presets"]["p"] = {"claude_model": "custom"}
+        cfg["active_preset"] = "p"
+        snap = user_config.snapshot_for_run(cfg)
+        self.assertEqual(snap["workflow"]["codex_review_session_max_turns"], 4)
+        self.assertEqual(snap["workflow"]["executable_search_paths"], ["/opt/dev/bin"])
+        self.assertTrue(snap["workflow"]["reuse_codex_review_context"])
 
 
 if __name__ == "__main__":

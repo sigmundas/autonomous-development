@@ -158,6 +158,11 @@ def default_config() -> dict[str, Any]:
         "workflow": {
             "max_review_rounds": 3,
             "process_timeout_seconds": 3600,
+            # Opt-in for new runs.  Missing/legacy snapshots retain the
+            # historical fresh-review behavior.
+            "reuse_codex_review_context": False,
+            "codex_review_session_max_turns": 3,
+            "executable_search_paths": [],
         },
         "presets": {},
         "claude_runtimes": {},
@@ -226,7 +231,25 @@ def validate_config(config: dict[str, Any]) -> list[str]:
                 f"workflow.workflow_mode {mode!r} is invalid; "
                 f"expected one of {VALID_WORKFLOW_MODES!r}."
             )
-    known_workflow = {"max_review_rounds", "process_timeout_seconds", "workflow_mode"}
+    if "reuse_codex_review_context" in workflow and not isinstance(
+        workflow["reuse_codex_review_context"], bool
+    ):
+        raise ConfigError("workflow.reuse_codex_review_context must be true or false.")
+    if "codex_review_session_max_turns" in workflow:
+        value = workflow["codex_review_session_max_turns"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 2 or value > 10:
+            raise ConfigError(
+                "workflow.codex_review_session_max_turns must be an integer in [2, 10]."
+            )
+    if "executable_search_paths" in workflow:
+        value = workflow["executable_search_paths"]
+        if not isinstance(value, list) or any(not isinstance(x, str) or not x for x in value):
+            raise ConfigError("workflow.executable_search_paths must be an array of non-empty paths.")
+    known_workflow = {
+        "max_review_rounds", "process_timeout_seconds", "workflow_mode",
+        "reuse_codex_review_context", "codex_review_session_max_turns",
+        "executable_search_paths",
+    }
     for key in workflow:
         if key not in known_workflow:
             warnings.append(f"Unknown key in [workflow]: {key!r} (ignored).")
@@ -511,7 +534,11 @@ def resolve_effective(
 
     workflow = config.get("workflow", {})
     if isinstance(workflow, dict):
-        for key in ("max_review_rounds", "process_timeout_seconds", "workflow_mode"):
+        for key in (
+            "max_review_rounds", "process_timeout_seconds", "workflow_mode",
+            "reuse_codex_review_context", "codex_review_session_max_turns",
+            "executable_search_paths",
+        ):
             if key in workflow:
                 effective["workflow"][key] = workflow[key]
 
@@ -839,6 +866,16 @@ def set_claude_model(config: dict[str, Any], name: str | None) -> dict[str, Any]
     return updated
 
 
+def set_review_context_reuse(config: dict[str, Any], enabled: bool) -> dict[str, Any]:
+    updated = _deep_copy(config)
+    workflow = updated.setdefault("workflow", {})
+    if not isinstance(workflow, dict):
+        raise ConfigError("`workflow` must be a table.")
+    workflow["reuse_codex_review_context"] = enabled
+    validate_config(updated)
+    return updated
+
+
 def _deep_copy(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _deep_copy(v) for k, v in value.items()}
@@ -1024,13 +1061,28 @@ def snapshot_for_run(
             merged[key] = value
         if merged:
             baked_codex[phase] = merged
-    return {
+    runtime_snapshot = None
+    runtime_name = effective["claude_runtime"]
+    runtimes = config.get("claude_runtimes", {}) or {}
+    if runtime_name and isinstance(runtimes.get(runtime_name), dict):
+        runtime = runtimes[runtime_name]
+        runtime_snapshot = {
+            "name": runtime_name,
+            "display_name": runtime.get("display_name"),
+            "launcher": runtime.get("launcher"),
+            "args": list(runtime.get("args", [])),
+            "safe_commands": list(runtime.get("safe_commands", [])),
+        }
+    result = {
         "preset": effective["active_preset"],
         "workflow": effective["workflow"],
         "codex": baked_codex,
         "claude_runtime": effective["claude_runtime"],
         "claude_model": _resolved_claude_model(config, effective["claude_model"]),
     }
+    if runtime_snapshot is not None:
+        result["claude_runtime_snapshot"] = runtime_snapshot
+    return result
 
 
 def _resolved_claude_model(
@@ -1039,6 +1091,8 @@ def _resolved_claude_model(
     if model_id is None:
         return None
     definition = (config.get("claude_models") or {}).get(model_id) or {}
+    if not isinstance(definition.get("model"), str) or not definition["model"]:
+        return None
     result = {"id": model_id, "model": str(definition["model"])}
     display = definition.get("display_name")
     if isinstance(display, str) and display:
@@ -1067,6 +1121,7 @@ __all__ = [
     "set_claude_runtime",
     "set_claude_model",
     "set_phase",
+    "set_review_context_reuse",
     "snapshot_for_run",
     "validate_config",
     "workflow_mode_default",

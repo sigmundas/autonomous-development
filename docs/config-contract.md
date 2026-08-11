@@ -108,6 +108,9 @@ active_preset = "azure-autonomous"
 max_review_rounds = 3
 process_timeout_seconds = 3600
 workflow_mode = "standard"           # optional default; presets override
+reuse_codex_review_context = false    # snapshotted; legacy/default is fresh reviews
+codex_review_session_max_turns = 3    # bounded reviewer-session rotation
+executable_search_paths = ["/opt/homebrew/bin"] # optional run-check PATH additions
 
 [presets.azure-autonomous]
 workflow_mode = "standard"           # auto | lean | standard | rigorous
@@ -171,6 +174,9 @@ Constraints enforced at validation time:
 - `reasoning_effort` values must be one of
   `minimal | low | medium | high | xhigh`.
 - `workflow_mode` must be one of `auto | lean | standard | rigorous`.
+- Reviewer-context reuse is opt-in and affects new runs only. Regular and
+  adversarial reviewers use independent session families; planning and
+  enhancement remain fresh. Unsupported resume safely falls back to fresh.
 - `active_preset`, when set, must name a defined preset.
 - A preset's `claude_runtime`, when set, must name a defined runtime.
 - Runtime `allowed_commands` entries are simple executable/subcommand prefixes.
@@ -182,6 +188,8 @@ Constraints enforced at validation time:
   the Default selection and does not pass `--model` to Claude Code.
 - Claude model definitions are user-extensible; no provider catalog is
   hardcoded. The exact CLI value is persisted into each run snapshot.
+- New runs snapshot the selected model id, display name, and exact CLI value;
+  later global changes cannot alter resume or fresh-session rollover behavior.
 - Secret-shaped keys (`api_key`, `token`, `bearer`, `password`,
   `credential(s)`, `authorization`) are refused at any depth. The
   autonomous config never stores credentials.

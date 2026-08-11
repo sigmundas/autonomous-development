@@ -83,6 +83,13 @@ class UsageParseTests(unittest.TestCase):
     def test_parse_model_absent(self) -> None:
         self.assertIsNone(controller.parse_codex_model('{"type": "item"}\n'))
 
+    def test_parse_exact_codex_session_id(self) -> None:
+        ndjson = '{"type":"thread.started","thread_id":"thread-123"}\n'
+        self.assertEqual(controller.parse_codex_session_id(ndjson), "thread-123")
+
+    def test_session_id_is_never_guessed(self) -> None:
+        self.assertIsNone(controller.parse_codex_session_id('{"type":"turn.started"}\n'))
+
 
 class ProcessTimeoutTests(unittest.TestCase):
     def test_resolve_timeout_default_and_overrides(self) -> None:
