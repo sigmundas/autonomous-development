@@ -159,7 +159,20 @@ class LoadValidateTests(_TempMixin):
             "executable_paths": ["/opt/homebrew/bin"],
         }
         self.assertEqual(user_config.validate_config(cfg), [])
-        for unsafe in ("uv && rm -rf .", "bash", "git reset --hard", "git push"):
+        for unsafe in (
+            "uv && rm -rf .",
+            "bash",
+            "sh",
+            "zsh",
+            "fish",
+            "powershell",
+            "pwsh",
+            "cmd",
+            "cmd.exe",
+            "git",
+            "git reset --hard",
+            "git push",
+        ):
             cfg["claude_runtimes"]["local"]["allowed_commands"] = [unsafe]
             with self.assertRaises(user_config.ConfigError):
                 user_config.validate_config(cfg)
