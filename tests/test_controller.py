@@ -1421,6 +1421,91 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(final["reviews"][0]["delta"])
         self.assertTrue(final["reviews"][1]["delta"])
 
+    def test_codex_resume_failure_retries_with_authoritative_fresh_prompt(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "F", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        run_dir = state_path.parent
+        (run_dir / "accepted-spec.md").write_text("accepted spec body", encoding="utf-8")
+        (run_dir / "accepted-plan.md").write_text("accepted plan body", encoding="utf-8")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.setdefault("verification", {})["checks"] = [
+            {"name": "focused", "command": ["pytest"], "exit_code": 0, "passed": True}
+        ]
+        state["verification"]["passed"] = True
+        state["config_snapshot"] = {
+            "workflow": {
+                "reuse_codex_review_context": True,
+                "codex_review_session_max_turns": 3,
+            },
+            "codex": {},
+        }
+        state["codex_sessions"] = {
+            "review": {"session_id": "session-prior", "turn_count": 1}
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        prompts: list[str] = []
+
+        def fake_run_process(cmd, *, cwd, input_text=None, check=False, timeout=None):
+            if cmd and cmd[0] == "git":
+                return original_run(
+                    cmd, cwd=cwd, input_text=input_text, check=check, timeout=timeout
+                )
+            prompts.append(input_text or "")
+            if "resume" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="resume failed")
+            out_path = Path(cmd[cmd.index("--output-last-message") + 1])
+            out_path.write_text(
+                json.dumps(
+                    {
+                        "verdict": "pass",
+                        "summary": "ok",
+                        "findings": [],
+                        "verification_gaps": [],
+                        "acceptance_criteria_assessment": [],
+                        "confidence": 1.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"type":"thread.started","thread_id":"session-fresh"}\n',
+                stderr="",
+            )
+
+        original_run = controller.run_process
+        original_capability = controller.codex_resume_supports_safe_structured_exec
+        controller.run_process = fake_run_process
+        controller.codex_resume_supports_safe_structured_exec = lambda: True
+        try:
+            args = argparse.Namespace(
+                project_root=str(repo),
+                state_dir=str(state_home),
+                run_id=None,
+                phase="review",
+            )
+            self.assertEqual(controller.cmd_codex(args), 0)
+        finally:
+            controller.run_process = original_run
+            controller.codex_resume_supports_safe_structured_exec = original_capability
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Continue the independent review reviewer session", prompts[0])
+        self.assertIn("ACCEPTED SPECIFICATION", prompts[1])
+        self.assertIn("accepted spec body", prompts[1])
+        self.assertIn("ACCEPTED IMPLEMENTATION PLAN", prompts[1])
+        self.assertIn("accepted plan body", prompts[1])
+        self.assertIn("RECORDED VERIFICATION", prompts[1])
+        self.assertNotEqual(prompts[0], prompts[1])
+        final = json.loads(state_path.read_text(encoding="utf-8"))
+        usage = final["codex_runs"][-1]
+        self.assertEqual(usage["session_mode"], "fresh")
+        self.assertTrue(usage["session_fallback"])
+
     def test_review_round_mode_mismatch_fails_closed(self) -> None:
         """If a concurrent same-run invocation advances review_round between the
         pre-lock mode selection and the locked merge, cmd_codex must fail closed

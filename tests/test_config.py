@@ -159,7 +159,20 @@ class LoadValidateTests(_TempMixin):
             "executable_paths": ["/opt/homebrew/bin"],
         }
         self.assertEqual(user_config.validate_config(cfg), [])
-        for unsafe in ("uv && rm -rf .", "bash", "git reset --hard", "git push"):
+        for unsafe in (
+            "uv && rm -rf .",
+            "bash",
+            "sh",
+            "zsh",
+            "fish",
+            "powershell",
+            "pwsh",
+            "cmd",
+            "cmd.exe",
+            "git",
+            "git reset --hard",
+            "git push",
+        ):
             cfg["claude_runtimes"]["local"]["allowed_commands"] = [unsafe]
             with self.assertRaises(user_config.ConfigError):
                 user_config.validate_config(cfg)
@@ -434,6 +447,7 @@ class ConfigCliTests(_TempMixin):
             ("config-set-active-preset", "global"),
             ("config-set-claude-runtime", "local"),
             ("config-set-claude-model", "custom"),
+            ("config-set-review-context-reuse", "true"),
             (
                 "config-set-phase",
                 "--preset",
@@ -458,6 +472,21 @@ class ConfigCliTests(_TempMixin):
             ).stdout
         )
         self.assertIn("outside-git", {p["id"] for p in profiles["profiles"]})
+        payload = json.loads(
+            self._controller(non_repo, state_home, "config-show", codex_home=codex).stdout
+        )
+        self.assertEqual(payload["effective"]["claude_model"]["model"], "custom/exact")
+        self.assertTrue(payload["effective"]["workflow"]["reuse_codex_review_context"])
+
+    def test_config_show_succeeds_from_filesystem_root_without_project_root(self) -> None:
+        state_home = self.make_tmp()
+        result = subprocess.run(
+            [sys.executable, str(CONTROLLER), "--state-dir", str(state_home), "config-show", "--json"],
+            cwd="/",
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_run_command_still_rejects_non_git_project_root(self) -> None:
         non_repo = self.make_tmp()
@@ -536,6 +565,49 @@ class ConfigCliTests(_TempMixin):
                 "display_name": "Custom Model",
                 "model": "provider/custom-exact",
             },
+        )
+
+    def test_runtime_snapshot_is_stable_after_global_config_changes(self) -> None:
+        cfg = user_config.default_config()
+        runtime = {
+            "display_name": "Anthropic · Claude",
+            "launcher": "claude",
+            "args": ["--profile", "initial"],
+            "allowed_commands": ["ruff", "npm run test"],
+            "executable_paths": ["/opt/homebrew/bin", "~/.local/bin"],
+        }
+        cfg["claude_runtimes"]["anthropic-claude"] = runtime
+        cfg["presets"]["test"] = {"claude_runtime": "anthropic-claude"}
+        cfg["active_preset"] = "test"
+        snapshot = user_config.snapshot_for_run(cfg)
+
+        self.assertEqual(
+            snapshot["claude_runtime_snapshot"],
+            {
+                "name": "anthropic-claude",
+                "display_name": "Anthropic · Claude",
+                "launcher": "claude",
+                "args": ["--profile", "initial"],
+                "allowed_commands": ["ruff", "npm run test"],
+                "executable_paths": ["/opt/homebrew/bin", "~/.local/bin"],
+            },
+        )
+
+        runtime["args"].append("--changed")
+        runtime["allowed_commands"].append("pytest")
+        runtime["executable_paths"].append("/changed/bin")
+
+        self.assertEqual(
+            snapshot["claude_runtime_snapshot"]["args"],
+            ["--profile", "initial"],
+        )
+        self.assertEqual(
+            snapshot["claude_runtime_snapshot"]["allowed_commands"],
+            ["ruff", "npm run test"],
+        )
+        self.assertEqual(
+            snapshot["claude_runtime_snapshot"]["executable_paths"],
+            ["/opt/homebrew/bin", "~/.local/bin"],
         )
 
     def test_config_validate_rejects_bad_toml(self) -> None:
@@ -1148,6 +1220,43 @@ class PresetWorkflowModeCliTests(_TempMixin):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["requested_mode"], "auto")
         self.assertEqual(state["mode_origin"], "default")
+
+
+class ReviewContextConfigurationTests(unittest.TestCase):
+    def test_default_is_backward_compatible_fresh_reviews(self) -> None:
+        cfg = user_config.default_config()
+        self.assertFalse(cfg["workflow"]["reuse_codex_review_context"])
+
+    def test_toggle_is_validated_and_snapshotted(self) -> None:
+        cfg = user_config.set_review_context_reuse(user_config.default_config(), True)
+        user_config.validate_config(cfg)
+        snap = user_config.snapshot_for_run(cfg)
+        self.assertTrue(snap["workflow"]["reuse_codex_review_context"])
+        cfg["workflow"]["reuse_codex_review_context"] = False
+        self.assertTrue(snap["workflow"]["reuse_codex_review_context"])
+
+    def test_non_boolean_toggle_is_rejected(self) -> None:
+        cfg = user_config.default_config()
+        cfg["workflow"]["reuse_codex_review_context"] = "yes"
+        with self.assertRaises(user_config.ConfigError):
+            user_config.validate_config(cfg)
+
+    def test_runtime_efficiency_workflow_fields_survive_model_snapshot(self) -> None:
+        cfg = user_config.default_config()
+        cfg["workflow"].update(
+            {
+                "reuse_codex_review_context": True,
+                "codex_review_session_max_turns": 4,
+                "executable_search_paths": ["/opt/dev/bin"],
+            }
+        )
+        cfg["claude_models"]["custom"] = {"model": "custom-exact"}
+        cfg["presets"]["p"] = {"claude_model": "custom"}
+        cfg["active_preset"] = "p"
+        snap = user_config.snapshot_for_run(cfg)
+        self.assertEqual(snap["workflow"]["codex_review_session_max_turns"], 4)
+        self.assertEqual(snap["workflow"]["executable_search_paths"], ["/opt/dev/bin"])
+        self.assertTrue(snap["workflow"]["reuse_codex_review_context"])
 
 
 if __name__ == "__main__":

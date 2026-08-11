@@ -764,6 +764,69 @@ def parse_codex_model(ndjson_text: str) -> str | None:
     return None
 
 
+def parse_codex_session_id(ndjson_text: str) -> str | None:
+    """Read the real session/thread id from Codex machine-readable events."""
+    for line in ndjson_text.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        candidates = [event]
+        for key in ("thread", "session", "msg", "info"):
+            value = event.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+        for candidate in candidates:
+            for key in ("thread_id", "session_id"):
+                value = candidate.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        if event.get("type") == "thread.started":
+            value = event.get("thread_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def codex_resume_supports_safe_structured_exec() -> bool:
+    """Require every flag needed to preserve fresh-exec safety/configuration."""
+    try:
+        result = subprocess.run(
+            ["codex", "exec", "resume", "--help"], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    help_text = result.stdout + result.stderr
+    return result.returncode == 0 and all(
+        flag in help_text
+        for flag in ("--json", "--output-schema", "--output-last-message", "--profile", "--sandbox")
+    )
+
+
+def codex_session_telemetry(
+    *,
+    reuse_enabled: bool,
+    resume_supported: bool,
+    resume_id: str | None,
+    resume_fallback: bool,
+    rotation: bool,
+) -> dict[str, Any]:
+    """Describe session behavior without treating unavailable reuse as failure."""
+    result: dict[str, Any] = {
+        "session_mode": "resumed" if resume_id and not resume_fallback else "fresh",
+        "session_rotation": rotation,
+        "session_fallback": resume_fallback,
+    }
+    if reuse_enabled:
+        result["session_resume_capability"] = (
+            "supported" if resume_supported else "unsupported"
+        )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Workflow modes
 # ---------------------------------------------------------------------------
@@ -2002,7 +2065,10 @@ def cmd_codex(args: argparse.Namespace) -> int:
     if is_delta_review:
         values["CHANGED_SINCE_LAST_REVIEW"] = render_changed_since_previous(repo, state)
     base_prompt = render(template, values)
-    prompt = base_prompt + visual_prompt(evidence_result, images_attached)
+    authoritative_fresh_prompt = base_prompt + visual_prompt(
+        evidence_result, images_attached
+    )
+    prompt = authoritative_fresh_prompt
     prompt_path = run_dir / f"{phase}.prompt.md"
     prompt_path.write_text(prompt, encoding="utf-8")
     # Stage Codex output/events under invocation-unique names so a concurrent or
@@ -2014,6 +2080,56 @@ def cmd_codex(args: argparse.Namespace) -> int:
     profile, profile_id = resolve_phase_execution(
         phase, snapshot=snapshot if isinstance(snapshot, dict) else None
     )
+    workflow_snapshot = snapshot.get("workflow", {}) if isinstance(snapshot, dict) else {}
+    reuse_review_context = bool(
+        workflow_snapshot.get("reuse_codex_review_context", False)
+    ) and phase in {"review", "adversarial"}
+    family = phase if phase in {"review", "adversarial"} else phase
+    family_round = next_round if phase == "review" else index if phase == "adversarial" else 1
+    sessions = state.get("codex_sessions", {}) if isinstance(state.get("codex_sessions"), dict) else {}
+    session = sessions.get(family) if isinstance(sessions.get(family), dict) else None
+    max_session_turns = int(workflow_snapshot.get("codex_review_session_max_turns", 3))
+    rotation = bool(
+        reuse_review_context
+        and session
+        and int(session.get("turn_count", 1)) >= max_session_turns
+    )
+    resume_supported = reuse_review_context and codex_resume_supports_safe_structured_exec()
+    resume_id = (
+        str(session.get("session_id"))
+        if session and not rotation and resume_supported and session.get("session_id")
+        else None
+    )
+    if resume_id:
+        latest_checks = latest_verification_checks(
+            state.get("verification", {}).get("checks", [])
+        )
+        prompt = "\n".join(
+            [
+                f"Continue the independent {family} reviewer session for round {family_round}.",
+                "Repository state changed since the previous turn. Inspect current files and do not rely on remembered source contents.",
+                f"Current changed-path delta:\n{render_changed_since_previous(repo, state)}",
+                f"Current verification: {json.dumps(latest_checks, separators=(',', ':'))}",
+                f"Findings to reassess: {json.dumps(state.get('cumulative_findings', []), separators=(',', ':'))}",
+                f"Acceptance criteria: {json.dumps(state.get('cumulative_acceptance_criteria', []), separators=(',', ':'))}",
+                "The controller's accepted specification, accepted plan, dispositions, and current checkout are authoritative. Return the required structured schema.",
+            ]
+        ) + visual_prompt(evidence_result, images_attached)
+        prompt_path.write_text(prompt, encoding="utf-8")
+    if rotation:
+        prompt = "\n\n".join(
+            [
+                f"Fresh independent {family} reviewer session, rotated at round {family_round}. Inspect current files; controller state is authoritative.",
+                f"Accepted specification:\n{values['ACCEPTED_SPEC']}",
+                f"Accepted plan:\n{values['ACCEPTED_PLAN']}",
+                f"Current delta:\n{render_changed_since_previous(repo, state)}",
+                f"Verification:\n{values['VERIFICATION']}",
+                f"Findings/dispositions to reassess:\n{values['FINDING_LEDGER']}",
+                f"Acceptance criteria:\n{values['ACCEPTANCE_CRITERIA']}",
+                "Return the required structured schema. Preserve finding provenance and inspect current source rather than relying on stale contents.",
+            ]
+        ) + visual_prompt(evidence_result, images_attached)
+        prompt_path.write_text(prompt, encoding="utf-8")
     command_without_images = [
         "codex",
         "exec",
@@ -2031,7 +2147,18 @@ def cmd_codex(args: argparse.Namespace) -> int:
         for image_path in (evidence_result.image_paths or [])
         for argument in ("--image", str(image_path))
     ] if images_attached else []
-    command = [*command_without_images, *image_args, "-"]
+    if resume_id:
+        # Capability detection requires resume to expose the same explicit
+        # profile and sandbox controls as fresh exec.  Never rely on --last.
+        command = [
+            "codex", "exec", "resume", "--json", "--sandbox", "read-only",
+            "--output-schema", str(PLUGIN_ROOT / schema_rel),
+            "--output-last-message", str(output_path),
+            *codex_profile_args(profile, profile_id=profile_id),
+            *image_args, resume_id, "-",
+        ]
+    else:
+        command = [*command_without_images, *image_args, "-"]
     started_at = utc_now()
     started_monotonic = time.monotonic()
     result = run_process(
@@ -2040,6 +2167,20 @@ def cmd_codex(args: argparse.Namespace) -> int:
         input_text=prompt,
         timeout=getattr(args, "timeout", None),
     )
+    resume_fallback = False
+    if resume_id and result.returncode != 0:
+        # Reuse is an optimization only. A new process has none of the resumed
+        # session's memory, so retry with the complete authoritative prompt,
+        # never the compact continuation/delta prompt sent to `exec resume`.
+        resume_fallback = True
+        output_path.unlink(missing_ok=True)
+        command = [*command_without_images, *image_args, "-"]
+        prompt = authoritative_fresh_prompt
+        prompt_path.write_text(prompt, encoding="utf-8")
+        result = run_process(
+            command, cwd=repo.canonical_root, input_text=prompt,
+            timeout=getattr(args, "timeout", None),
+        )
     # A CLI can advertise --image while the selected provider/model rejects
     # visual input. Retry only that recognizable capability failure, preserving
     # screenshots as artifacts but making the fallback prompt explicit.
@@ -2154,6 +2295,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 _require_finding_items(list(parsed.get("findings", [])), "findings")
 
         token_usage = parse_codex_usage(result.stdout)
+        returned_session_id = parse_codex_session_id(result.stdout)
         # Prefer the concrete model reported by Codex; fall back to the explicit
         # profile model, then a placeholder when the model is inherited from config.
         recorded_model = (
@@ -2339,10 +2481,35 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 "started_at": started_at,
                 "events_artifact": make_relative_path(events_path, run_dir),
                 "output_artifact": make_relative_path(final_path, run_dir),
+                "session_family": family,
+                "round": family_round,
+                **codex_session_telemetry(
+                    reuse_enabled=reuse_review_context,
+                    resume_supported=resume_supported,
+                    resume_id=resume_id,
+                    resume_fallback=resume_fallback,
+                    rotation=rotation,
+                ),
             }
+            if returned_session_id:
+                usage_record["session_id"] = returned_session_id
             if token_usage:
                 usage_record["tokens"] = token_usage
             state.setdefault("codex_runs", []).append(usage_record)
+            if reuse_review_context and returned_session_id:
+                codex_sessions = state.setdefault("codex_sessions", {})
+                prior_turns = 0 if rotation or not resume_id else int((session or {}).get("turn_count", 0))
+                codex_sessions[family] = {
+                    "session_id": returned_session_id,
+                    "started_at": (session or {}).get("started_at", started_at)
+                    if resume_id and not rotation else started_at,
+                    "last_round": family_round,
+                    "turn_count": prior_turns + 1,
+                }
+                if rotation:
+                    state.setdefault("notes", []).append(
+                        f"Rotated {family} Codex reviewer session at round {family_round}."
+                    )
 
             state["stop_gate_blocks"] = 0
             save_run_state(run_dir, state)
@@ -2841,9 +3008,22 @@ def cmd_run_check(args: argparse.Namespace) -> int:
     # Run the check outside the lock — may be long-running.
     started = utc_now()
     started_monotonic = time.monotonic()
-    result = run_process(
-        command, cwd=repo.canonical_root, timeout=getattr(args, "timeout", None)
-    )
+    check_env = os.environ.copy()
+    snapshot = run_ref.state.get("config_snapshot")
+    workflow_snapshot = snapshot.get("workflow", {}) if isinstance(snapshot, dict) else {}
+    configured_paths = workflow_snapshot.get("executable_search_paths", [])
+    safe_paths: list[str] = []
+    if isinstance(configured_paths, list):
+        safe_paths = [str(Path(p).expanduser()) for p in configured_paths if isinstance(p, str) and p]
+        if safe_paths:
+            check_env["PATH"] = os.pathsep.join([*safe_paths, check_env.get("PATH", "")])
+    run_kwargs: dict[str, Any] = {
+        "cwd": repo.canonical_root,
+        "timeout": getattr(args, "timeout", None),
+    }
+    if isinstance(configured_paths, list) and safe_paths:
+        run_kwargs["env"] = check_env
+    result = run_process(command, **run_kwargs)
     duration_seconds = round(time.monotonic() - started_monotonic, 1)
     completed = utc_now()
 
@@ -4920,6 +5100,23 @@ def cmd_next_action(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record_claude_rollover(args: argparse.Namespace) -> int:
+    repo, state_home, run_id_override = get_context(args)
+    run_ref = resolve_run_for_active_mutation(
+        state_home, repo.id, repo.canonical_root, run_id_override,
+        operation="record-claude-rollover",
+    )
+    with RunStateLock(run_ref.run_dir):
+        state = load_run_state(run_ref.run_dir)
+        require_active_run_state(state, run_ref.run_id, "record Claude rollover")
+        record = {"started_at": utc_now(), "context_signal": "unavailable"}
+        state.setdefault("claude_rollovers", []).append(record)
+        state.setdefault("notes", []).append("Continued in a fresh Claude session.")
+        save_run_state(run_ref.run_dir, state)
+    _print_json({"run_id": run_ref.run_id, "rollover": record})
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # User-configuration subcommands
 # ---------------------------------------------------------------------------
@@ -5147,6 +5344,14 @@ def cmd_config_set_claude_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config_set_review_context_reuse(args: argparse.Namespace) -> int:
+    config, path = _load_config_for_cmd(args)
+    updated = user_config.set_review_context_reuse(config, args.enabled == "true")
+    _persist_config(path, updated)
+    _print_json({"config_path": str(path), "reuse_codex_review_context": args.enabled == "true"})
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -5371,6 +5576,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     next_action.set_defaults(func=cmd_next_action)
 
+    rollover = sub.add_parser(
+        "record-claude-rollover",
+        help="Record a guarded fresh-session rollover for the same active run",
+    )
+    rollover.set_defaults(func=cmd_record_claude_rollover)
+
     triage = sub.add_parser(
         "triage", help="Merge triage finding-ledger entries into run state"
     )
@@ -5530,6 +5741,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cfg_set_model.add_argument("name", nargs="?")
     cfg_set_model.set_defaults(func=cmd_config_set_claude_model)
+
+    cfg_review_context = sub.add_parser(
+        "config-set-review-context-reuse",
+        help="Enable or disable Codex reviewer-session reuse for new runs",
+    )
+    cfg_review_context.add_argument("enabled", choices=("true", "false"))
+    cfg_review_context.set_defaults(func=cmd_config_set_review_context_reuse)
 
     return parser
 
