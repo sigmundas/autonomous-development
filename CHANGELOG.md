@@ -93,6 +93,14 @@ and are not claimed as functionality first introduced by this fork.
   discarded and the command reports both the Codex failure and the status change without
   touching the run.
 
+### Fixed
+- A preset `claude_model` that names an undefined `[claude_models.*]` entry (typically
+  after renaming a model id by hand) no longer makes the whole config file invalid. It
+  is now a validation warning, so `config-show`, `config-set-claude-runtime`, and
+  `config-set-claude-model` keep working and the reference can be repaired from the
+  VS Code Config panel. The effective model resolves to Default while dangling, and
+  `init` fails closed with an actionable message instead of silently dropping `--model`.
+
 ### Known limitations
 - `accept` artifact publication is exception-safe (it rolls back staged/backup files on a
   raised error) but not crash-safe: a process kill or power loss between backup creation,

@@ -281,12 +281,17 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             raise ConfigError(f"claude_models.{name} must be a table.")
         _validate_claude_model(name, model, warnings)
 
+    # A dangling model reference is a warning, not an error. Hand-editing the
+    # TOML (renaming or removing a `[claude_models.*]` entry) must never lock
+    # every `config-*` command out of the file — including the very command
+    # that repairs the reference. The effective model resolves to Default
+    # (no `--model`) for display, and `init` fails closed on it separately.
     for name, preset in presets.items():
         model_ref = preset.get("claude_model")
         if model_ref is not None and model_ref not in models:
-            raise ConfigError(
+            warnings.append(
                 f"presets.{name}.claude_model {model_ref!r} does not name a "
-                "defined Claude model."
+                "defined Claude model; it resolves to Default until reselected."
             )
 
     active_preset = config.get("active_preset")

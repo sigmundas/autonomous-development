@@ -143,21 +143,21 @@ launcher = "/Users/example/bin/claude-azure"
 allowed_commands = ["ruff", "npm run test"]
 executable_paths = ["/opt/homebrew/bin", "~/.local/bin"]
 
-[claude_models.sonnet]
-display_name = "Sonnet"
-model = "sonnet"                      # exact value accepted by claude --model
+[claude_models.fable]
+display_name = "Fable"
+model = "fable"                       # exact value passed to claude --model
 
 [claude_models.opus]
 display_name = "Opus"
 model = "opus"
 
-[claude_models.sonnet46-foundry]
-display_name = "Sonnet 4.6 · 1M"
-model = "claude-sonnet-4-6"
+[claude_models.sonnet]
+display_name = "Sonnet"
+model = "sonnet"
 
-[claude_models.opus48-foundry]
-display_name = "Opus 4.8 · 1M"
-model = "claude-opus-4-8"
+[claude_models.haiku]
+display_name = "Haiku"
+model = "haiku"
 ```
 
 These are examples, not a built-in catalog. Define the stable ids, labels, and
@@ -165,6 +165,17 @@ exact `claude --model` values supported by your Claude Code account/provider.
 The runtime selects the launcher environment; the model independently selects
 the Claude session model. Omit `claude_model` from a preset for Default behavior
 with no explicit `--model` argument.
+
+The recommended catalog uses Claude Code's family aliases (`fable`, `opus`,
+`sonnet`, `haiku`) as both the id and the `model` value, so the front-facing
+names stay provider-neutral. Claude Code resolves an alias to a concrete model
+per provider: on the first-party API it picks the latest model of that family,
+and on Microsoft Foundry, Bedrock, or Vertex it reads the deployment name from
+`ANTHROPIC_DEFAULT_FABLE_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`,
+`ANTHROPIC_DEFAULT_SONNET_MODEL`, and `ANTHROPIC_DEFAULT_HAIKU_MODEL`. Put that
+translation in the provider-specific launcher's environment (the script named
+by `claude_runtimes.<name>.launcher`), not in this file: the controller never
+maps model names itself and passes `model` through verbatim.
 
 Constraints enforced at validation time:
 
@@ -184,8 +195,14 @@ Constraints enforced at validation time:
 - Runtime `executable_paths` entries are prepended to the inherited Claude/controller
   PATH. They provide predictable direct executable lookup without a login-shell wrapper.
   The VS Code launcher also prepends the directory containing an absolute Claude launcher.
-- A preset's optional `claude_model` must name a defined model. Omitting it is
-  the Default selection and does not pass `--model` to Claude Code.
+- A preset's optional `claude_model` should name a defined model. Omitting it is
+  the Default selection and does not pass `--model` to Claude Code. A reference
+  to an undefined model (for example after renaming a `[claude_models.*]` entry
+  by hand) is a validation *warning*, not an error: the file stays loadable and
+  every `config-*` command keeps working so the reference can be repaired with
+  `config-set-claude-model`. Until then `config-show` reports `claude_model: null`
+  (Default), and `controller.py init` refuses to start a run with the dangling
+  reference rather than silently dropping `--model`.
 - Claude model definitions are user-extensible; no provider catalog is
   hardcoded. The exact CLI value is persisted into each run snapshot.
 - New runs snapshot the selected model id, display name, and exact CLI value;

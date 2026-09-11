@@ -647,6 +647,19 @@ def _load_and_snapshot_config(
                 f"Preset references claude_runtime {runtime!r} which is not "
                 "defined in the configuration."
             )
+
+    # Validation only warns about a dangling `claude_model` so the config
+    # remains editable; starting a run with it would silently drop `--model`,
+    # so fail closed here instead.
+    preset_name = snapshot.get("preset")
+    preset = (config.get("presets") or {}).get(preset_name) if preset_name else None
+    model_ref = preset.get("claude_model") if isinstance(preset, dict) else None
+    if model_ref and model_ref not in (config.get("claude_models") or {}):
+        raise WorkflowError(
+            f"Preset {preset_name!r} references claude_model {model_ref!r} which is "
+            "not defined in the configuration. Select a defined model (or Default) "
+            "with config-set-claude-model before starting a run."
+        )
     return snapshot, warnings, config
 
 
