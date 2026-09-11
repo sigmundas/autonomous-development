@@ -177,6 +177,13 @@ translation in the provider-specific launcher's environment (the script named
 by `claude_runtimes.<name>.launcher`), not in this file: the controller never
 maps model names itself and passes `model` through verbatim.
 
+Two layers of checks apply. *Structural validation* (`config-validate`,
+`config-show`, and every `config-*` mutation before it persists) checks the
+shape of the file and rejects malformed values. *Run-start validation*
+(`controller.py init`, see "Init & run snapshot") additionally fails closed
+when the selected preset references something that does not exist, so a run
+can never be snapshotted against a missing runtime, model, or Codex profile.
+
 Constraints enforced at validation time:
 
 - `version` must be `1` (only supported version).
@@ -189,7 +196,11 @@ Constraints enforced at validation time:
   adversarial reviewers use independent session families; planning and
   enhancement remain fresh. Unsupported resume safely falls back to fresh.
 - `active_preset`, when set, must name a defined preset.
-- A preset's `claude_runtime`, when set, must name a defined runtime.
+- A preset's `claude_runtime`, when set, must be a non-empty string. Whether
+  it names a defined `[claude_runtimes.*]` entry is *not* checked here (so a
+  runtime can be renamed or removed without locking the file); it is checked
+  at run start, where `init` refuses to start a run whose selected preset
+  references an undefined runtime.
 - Runtime `allowed_commands` entries are simple executable/subcommand prefixes.
   Shell syntax, shell launchers, and destructive or unbounded Git commands are rejected.
 - Runtime `executable_paths` entries are prepended to the inherited Claude/controller
@@ -200,9 +211,12 @@ Constraints enforced at validation time:
   to an undefined model (for example after renaming a `[claude_models.*]` entry
   by hand) is a validation *warning*, not an error: the file stays loadable and
   every `config-*` command keeps working so the reference can be repaired with
-  `config-set-claude-model`. Until then `config-show` reports `claude_model: null`
-  (Default), and `controller.py init` refuses to start a run with the dangling
-  reference rather than silently dropping `--model`.
+  `config-set-claude-model [--preset P] NAME`. Until then `config-show` reports
+  `claude_model: null` (Default), and `controller.py init` refuses to start a
+  run whose selected preset carries the dangling reference rather than silently
+  dropping `--model`. The init error names the affected preset and the exact
+  repair command, because with `init --preset P` the affected preset may not be
+  `active_preset`.
 - Claude model definitions are user-extensible; no provider catalog is
   hardcoded. The exact CLI value is persisted into each run snapshot.
 - New runs snapshot the selected model id, display name, and exact CLI value;
@@ -348,10 +362,26 @@ Returns the user-defined stable ids, display names, and exact Claude CLI model
 values. The list is configuration-driven and is not restricted to a built-in
 catalog.
 
-### `config-set-claude-model [NAME]`
+### `config-set-claude-model [--preset P] [NAME]`
 
-Sets the active preset's `claude_model` reference. Omitting `NAME` selects
-Default by removing the reference, so new launches do not pass `--model`.
+Sets a preset's `claude_model` reference. The target is `--preset P` when
+given, otherwise the active preset (unchanged default behavior). Omitting
+`NAME` selects Default by removing the reference, so new launches do not pass
+`--model`. `NAME` must be defined in `[claude_models.*]` and `P` must be a
+defined preset. `active_preset` is never modified by this command.
+
+```json
+{
+  "config_path": "/…/config.toml",
+  "active_preset": "azure-autonomous",
+  "preset": "benchmark",
+  "claude_model": "opus"
+}
+```
+
+`preset` is the preset that was actually edited. Use `--preset` to repair a
+dangling reference reported by `init --preset P` without switching
+`active_preset`.
 
 ### `config-set-active-preset NAME`
 
@@ -456,6 +486,13 @@ Rules that follow from the snapshot:
   is a hard init failure, regardless of whether the preset was chosen
   via `--preset` or via `active_preset`. An omitted profile is valid
   and means "let Codex resolve the model normally".
+- Likewise, a selected preset whose `claude_runtime` or `claude_model` names
+  an undefined `[claude_runtimes.*]` / `[claude_models.*]` entry is a hard
+  init failure. Structural validation deliberately leaves these references
+  editable (a type check for the runtime, a warning for the model); init is
+  where existence is enforced, for both `--preset` and `active_preset`. The
+  model error names the affected preset and the repair command
+  `config-set-claude-model --preset <preset> <model>`.
 
 Never snapshotted: API keys, bearer tokens, or any other credential-shaped
 value. The controller rejects such keys at validation time and the

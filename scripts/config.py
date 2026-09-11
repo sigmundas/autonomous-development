@@ -850,14 +850,35 @@ def set_claude_runtime(config: dict[str, Any], name: str) -> dict[str, Any]:
     return updated
 
 
-def set_claude_model(config: dict[str, Any], name: str | None) -> dict[str, Any]:
-    """Set or clear the active preset's Claude model selection."""
-    active = config.get("active_preset")
-    if not active:
-        raise ConfigError("Cannot set claude_model: no active preset is selected.")
+def set_claude_model(
+    config: dict[str, Any],
+    name: str | None,
+    *,
+    preset_name: str | None = None,
+) -> dict[str, Any]:
+    """Set or clear a preset's Claude model selection.
+
+    The target is ``preset_name`` when given, otherwise the current
+    ``active_preset``. Targeting an explicit preset lets a dangling reference
+    be repaired on a preset selected via ``init --preset`` without changing
+    ``active_preset``. The target preset must already be defined.
+    """
     presets = config.get("presets", {}) or {}
-    if active not in presets:
-        raise ConfigError(f"Active preset {active!r} is not defined.")
+    if preset_name is not None:
+        if preset_name not in presets:
+            raise ConfigError(
+                f"Cannot set claude_model: preset {preset_name!r} is not defined."
+            )
+        target = preset_name
+    else:
+        active = config.get("active_preset")
+        if not active:
+            raise ConfigError(
+                "Cannot set claude_model: no active preset is selected."
+            )
+        if active not in presets:
+            raise ConfigError(f"Active preset {active!r} is not defined.")
+        target = active
     models = config.get("claude_models", {}) or {}
     if name is not None and name not in models:
         raise ConfigError(
@@ -865,9 +886,9 @@ def set_claude_model(config: dict[str, Any], name: str | None) -> dict[str, Any]
         )
     updated = _deep_copy(config)
     if name is None:
-        updated["presets"][active].pop("claude_model", None)
+        updated["presets"][target].pop("claude_model", None)
     else:
-        updated["presets"][active]["claude_model"] = name
+        updated["presets"][target]["claude_model"] = name
     return updated
 
 
