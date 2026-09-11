@@ -647,6 +647,22 @@ def _load_and_snapshot_config(
                 f"Preset references claude_runtime {runtime!r} which is not "
                 "defined in the configuration."
             )
+
+    # Validation only warns about a dangling `claude_model` so the config
+    # remains editable; starting a run with it would silently drop `--model`,
+    # so fail closed here instead.
+    preset_name = snapshot.get("preset")
+    preset = (config.get("presets") or {}).get(preset_name) if preset_name else None
+    model_ref = preset.get("claude_model") if isinstance(preset, dict) else None
+    if model_ref and model_ref not in (config.get("claude_models") or {}):
+        # Name the preset explicitly: with `init --preset`, the selected preset
+        # may differ from `active_preset`, which is what the bare command edits.
+        raise WorkflowError(
+            f"Preset {preset_name!r} references claude_model {model_ref!r} which is "
+            "not defined in the configuration. Select a defined model (or omit the "
+            f"name for Default) with `config-set-claude-model --preset {preset_name} "
+            "<model>` before starting a run."
+        )
     return snapshot, warnings, config
 
 
@@ -5329,8 +5345,11 @@ def cmd_config_list_claude_models(args: argparse.Namespace) -> int:
 
 def cmd_config_set_claude_model(args: argparse.Namespace) -> int:
     config, path = _load_config_for_cmd(args)
+    target_preset = getattr(args, "preset", None) or None
     try:
-        updated = user_config.set_claude_model(config, args.name)
+        updated = user_config.set_claude_model(
+            config, args.name, preset_name=target_preset
+        )
     except ConfigError as exc:
         raise WorkflowError(str(exc)) from exc
     _persist_config(path, updated)
@@ -5338,6 +5357,7 @@ def cmd_config_set_claude_model(args: argparse.Namespace) -> int:
         {
             "config_path": str(path),
             "active_preset": updated.get("active_preset"),
+            "preset": target_preset or updated.get("active_preset"),
             "claude_model": args.name,
         }
     )
@@ -5737,9 +5757,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     cfg_set_model = sub.add_parser(
         "config-set-claude-model",
-        help="Set the active preset's Claude model, or omit NAME for Default",
+        help="Set a preset's Claude model (active preset unless --preset), or omit NAME for Default",
     )
     cfg_set_model.add_argument("name", nargs="?")
+    cfg_set_model.add_argument(
+        "--preset",
+        help="Target this preset instead of active_preset (e.g. the preset passed to init --preset)",
+    )
     cfg_set_model.set_defaults(func=cmd_config_set_claude_model)
 
     cfg_review_context = sub.add_parser(

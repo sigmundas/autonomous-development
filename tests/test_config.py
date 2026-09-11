@@ -147,9 +147,39 @@ class LoadValidateTests(_TempMixin):
         cfg["presets"]["p"] = {"claude_model": "custom-opus"}
         cfg["active_preset"] = "p"
         self.assertEqual(user_config.validate_config(cfg), [])
+        # A dangling reference (e.g. after hand-renaming a model entry) must
+        # not make the whole file unusable: it warns and resolves to Default.
         cfg["presets"]["p"]["claude_model"] = "missing"
+        warnings = user_config.validate_config(cfg)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("presets.p.claude_model 'missing'", warnings[0])
+        effective = user_config.effective_with_origin(cfg, Path("/nonexistent"))
+        self.assertIsNone(effective["effective"]["claude_model"])
+        self.assertIsNone(user_config.snapshot_for_run(cfg)["claude_model"])
+        # Repairing via the update helpers works and clears the warning.
+        repaired = user_config.set_claude_model(cfg, "custom-opus")
+        self.assertEqual(user_config.validate_config(repaired), [])
+        cleared = user_config.set_claude_model(cfg, None)
+        self.assertEqual(user_config.validate_config(cleared), [])
+
+    def test_set_claude_model_can_target_a_non_active_preset(self) -> None:
+        cfg = user_config.default_config()
+        cfg["claude_models"]["custom"] = {"display_name": "Custom", "model": "m"}
+        cfg["presets"]["a"] = {"claude_model": "custom"}
+        cfg["presets"]["b"] = {"claude_model": "missing"}
+        cfg["active_preset"] = "a"
+        # Default behavior is unchanged: the bare call edits the active preset.
+        bare = user_config.set_claude_model(cfg, None)
+        self.assertNotIn("claude_model", bare["presets"]["a"])
+        self.assertEqual(bare["presets"]["b"]["claude_model"], "missing")
+        # An explicit target repairs B and leaves A and active_preset alone.
+        targeted = user_config.set_claude_model(cfg, "custom", preset_name="b")
+        self.assertEqual(targeted["presets"]["b"]["claude_model"], "custom")
+        self.assertEqual(targeted["presets"]["a"]["claude_model"], "custom")
+        self.assertEqual(targeted["active_preset"], "a")
+        self.assertEqual(user_config.validate_config(targeted), [])
         with self.assertRaises(user_config.ConfigError):
-            user_config.validate_config(cfg)
+            user_config.set_claude_model(cfg, "custom", preset_name="nope")
 
     def test_runtime_accepts_safe_custom_command_and_rejects_shell_or_dangerous_git(self) -> None:
         cfg = user_config.default_config()
@@ -566,6 +596,123 @@ class ConfigCliTests(_TempMixin):
                 "model": "provider/custom-exact",
             },
         )
+
+    def _state_home_with_dangling_model(self) -> Path:
+        state_home = self.make_tmp()
+        (state_home / "config.toml").write_text(
+            'version = 1\nactive_preset = "p"\n\n'
+            '[presets.p]\nclaude_runtime = "anthropic"\nclaude_model = "opus"\n\n'
+            '[claude_runtimes.anthropic]\nlauncher = "/bin/sh"\n\n'
+            '[claude_runtimes.other]\nlauncher = "/bin/sh"\n\n'
+            '[claude_models.opus48]\ndisplay_name = "Opus 4.8"\nmodel = "claude-opus-4-8"\n'
+        )
+        return state_home
+
+    def test_config_commands_recover_from_dangling_claude_model(self) -> None:
+        """Renaming a model entry by hand must leave the config repairable via
+        the controller (the VS Code Config panel only talks to config-*)."""
+        repo = self.make_repo()
+        state_home = self._state_home_with_dangling_model()
+        codex = self.make_tmp()
+
+        validation = self._controller(repo, state_home, "config-validate", codex_home=codex)
+        self.assertEqual(validation.returncode, 0, validation.stderr)
+        payload = json.loads(validation.stdout)
+        self.assertTrue(payload["valid"])
+        self.assertEqual(len(payload["warnings"]), 1)
+        self.assertIn("presets.p.claude_model 'opus'", payload["warnings"][0])
+
+        shown = self._controller(repo, state_home, "config-show", codex_home=codex)
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        shown_payload = json.loads(shown.stdout)
+        self.assertIsNone(shown_payload["effective"]["claude_model"])
+        self.assertEqual(shown_payload["warnings"], payload["warnings"])
+
+        # Unrelated mutations are not blocked by the dangling reference.
+        runtime = self._controller(
+            repo, state_home, "config-set-claude-runtime", "other", codex_home=codex
+        )
+        self.assertEqual(runtime.returncode, 0, runtime.stderr)
+
+        # Selecting a defined model repairs the file and clears the warning.
+        repaired = self._controller(
+            repo, state_home, "config-set-claude-model", "opus48", codex_home=codex
+        )
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        after = json.loads(
+            self._controller(repo, state_home, "config-validate", codex_home=codex).stdout
+        )
+        self.assertTrue(after["valid"])
+        self.assertEqual(after["warnings"], [])
+        saved = user_config.load_config(state_home / "config.toml")
+        self.assertEqual(saved["presets"]["p"]["claude_model"], "opus48")
+        self.assertEqual(saved["presets"]["p"]["claude_runtime"], "other")
+
+    def test_init_fails_closed_on_dangling_claude_model(self) -> None:
+        repo = self.make_repo()
+        state_home = self._state_home_with_dangling_model()
+        result = self._controller(
+            repo,
+            state_home,
+            "init",
+            "--feature",
+            "dangling model",
+            "--mode",
+            "standard",
+            codex_home=self.make_tmp(),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("claude_model 'opus'", result.stderr)
+        self.assertIn("config-set-claude-model --preset p", result.stderr)
+
+    def test_init_preset_override_with_dangling_model_names_the_right_preset(self) -> None:
+        """`init --preset B` must fail closed on B's dangling model and point
+        the user at a repair that edits B, not the unrelated `active_preset`."""
+        repo = self.make_repo()
+        state_home = self.make_tmp()
+        codex = self.make_tmp()
+        (state_home / "config.toml").write_text(
+            'version = 1\nactive_preset = "a"\n\n'
+            '[presets.a]\nclaude_model = "opus48"\n\n'
+            '[presets.b]\nclaude_model = "opus"\n\n'
+            '[claude_models.opus48]\ndisplay_name = "Opus 4.8"\nmodel = "claude-opus-4-8"\n'
+        )
+        init_args = ("init", "--feature", "preset override", "--mode", "standard")
+
+        failed = self._controller(
+            repo, state_home, *init_args, "--preset", "b", codex_home=codex
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Preset 'b' references claude_model 'opus'", failed.stderr)
+        self.assertIn("config-set-claude-model --preset b", failed.stderr)
+        self.assertNotIn("'a'", failed.stderr)
+
+        # Following the diagnostic repairs B; A and active_preset are untouched.
+        repaired = self._controller(
+            repo,
+            state_home,
+            "config-set-claude-model",
+            "--preset",
+            "b",
+            "opus48",
+            codex_home=codex,
+        )
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        payload = json.loads(repaired.stdout)
+        self.assertEqual(payload["preset"], "b")
+        self.assertEqual(payload["active_preset"], "a")
+        saved = user_config.load_config(state_home / "config.toml")
+        self.assertEqual(saved["active_preset"], "a")
+        self.assertEqual(saved["presets"]["a"]["claude_model"], "opus48")
+        self.assertEqual(saved["presets"]["b"]["claude_model"], "opus48")
+
+        succeeded = self._controller(
+            repo, state_home, *init_args, "--preset", "b", codex_home=codex
+        )
+        self.assertEqual(succeeded.returncode, 0, succeeded.stderr)
+        state = json.loads(Path(succeeded.stdout.strip()).read_text(encoding="utf-8"))
+        self.assertEqual(state["config_snapshot"]["preset"], "b")
+        self.assertEqual(state["config_snapshot"]["claude_model"]["id"], "opus48")
 
     def test_runtime_snapshot_is_stable_after_global_config_changes(self) -> None:
         cfg = user_config.default_config()

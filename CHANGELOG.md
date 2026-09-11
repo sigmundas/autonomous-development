@@ -93,6 +93,23 @@ and are not claimed as functionality first introduced by this fork.
   discarded and the command reports both the Codex failure and the status change without
   touching the run.
 
+### Fixed
+- A preset `claude_model` that names an undefined `[claude_models.*]` entry (typically
+  after renaming a model id by hand) no longer makes the whole config file invalid. It
+  is now a validation warning, so `config-show`, `config-set-claude-runtime`, and
+  `config-set-claude-model` keep working and the reference can be repaired from the
+  VS Code Config panel. The effective model resolves to Default while dangling, and
+  `init` fails closed with an actionable message instead of silently dropping `--model`.
+- `config-set-claude-model` accepts an optional `--preset P` so the dangling-model
+  error from `init --preset P` can be repaired on `P` itself. Previously the
+  diagnostic pointed at a command that only edited `active_preset`, which may be a
+  different preset. Without `--preset` the command behaves as before; its JSON
+  response gains a `preset` field naming the preset that was edited.
+- `docs/config-contract.md` now distinguishes structural validation (type-checks a
+  preset's `claude_runtime` reference) from run-start validation (`init` fails
+  closed on an undefined runtime or model). The previous wording claimed runtime
+  existence was enforced at validation time.
+
 ### Known limitations
 - `accept` artifact publication is exception-safe (it rolls back staged/backup files on a
   raised error) but not crash-safe: a process kill or power loss between backup creation,
